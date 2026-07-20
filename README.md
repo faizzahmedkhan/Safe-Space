@@ -40,3 +40,20 @@ Then open your browser to:
 - `http://127.0.0.1:8000/` : Health check
 - `http://127.0.0.1:8000/status` : System diagnostics
 - `http://127.0.0.1:8000/alerts` : Recent alerts and evidence
+
+## Training & Fine-Tuning the AI
+
+If you want to teach the AI on your own custom videos (e.g., to reduce false alarms from accidents):
+
+1. **Prepare your data:**
+   - Put short `.mp4` videos of normal activities in `data/safe/`
+   - Put short `.mp4` videos of fights/incidents in `data/unsafe/`
+   *(Note: The folders will be created automatically when you first run the script).*
+
+2. **Run the training script:**
+   ```bash
+   python train.py
+   ```
+
+3. **Enjoy the smarter model:**
+   The script will automatically fine-tune the model and overwrite `safespace_bullying_model.pth`. Next time you start `main.py`, it will use your upgraded model!

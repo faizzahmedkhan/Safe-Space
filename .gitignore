@@ -4,3 +4,5 @@ context.md
 __pycache__/
 *.pyc
 .DS_Store
+data/
+alerts.json
