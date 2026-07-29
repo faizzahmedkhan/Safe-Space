@@ -1,215 +1,601 @@
 import cv2
 import time
 import threading
+import socket
+import urllib.request
+import urllib.error
+import numpy as np
 from collections import deque
+from typing import Optional, Tuple
+from urllib.parse import urlparse, urlunparse
+from frame_prep import prepare_for_model
 
 CLIP_LENGTH = 16
 EVIDENCE_BUFFER_LEN = 60
+HTTP_USER_AGENT = "SafeSpace/1.0 (IP-Webcam client)"
+
+
+def _is_http_url(src) -> bool:
+  return isinstance(src, str) and src.lower().startswith(("http://", "https://"))
+
+
+def _origin(url: str) -> str:
+  parsed = urlparse(url)
+  return urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+
+def diagnose_http_camera(url: str, timeout: float = 4.0) -> dict:
+  """
+  Probe whether a phone IP Webcam URL is reachable.
+  Returns {ok, stage, message, detail}.
+  """
+  parsed = urlparse(url)
+  host = parsed.hostname
+  port = parsed.port or (443 if parsed.scheme == "https" else 80)
+  if not host:
+    return {
+      "ok": False,
+      "stage": "parse",
+      "message": "Invalid camera URL.",
+      "detail": url,
+    }
+
+  try:
+    with socket.create_connection((host, port), timeout=timeout):
+      pass
+  except OSError as e:
+    return {
+      "ok": False,
+      "stage": "tcp",
+      "message": (
+        f"Cannot reach {host}:{port} ({e}). "
+        "Confirm the phone IP in IP Webcam, that Start server is on, "
+        "and both devices are on the same Wi‑Fi (not guest/VPN)."
+      ),
+      "detail": str(e),
+    }
+
+  origin = _origin(url)
+  candidates = [url]
+  shot = f"{origin}/shot.jpg"
+  if shot not in candidates:
+    candidates.append(shot)
+
+  last_error = None
+  for candidate in candidates:
+    try:
+      req = urllib.request.Request(
+        candidate,
+        headers={"User-Agent": HTTP_USER_AGENT, "Connection": "close"},
+      )
+      with urllib.request.urlopen(req, timeout=timeout) as resp:
+        chunk = resp.read(2048)
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if chunk or "image" in ctype or "multipart" in ctype or "octet" in ctype:
+          return {
+            "ok": True,
+            "stage": "http",
+            "message": f"HTTP OK via {candidate}",
+            "detail": ctype,
+            "working_url": candidate,
+          }
+        last_error = f"{candidate} returned empty body"
+    except Exception as e:
+      last_error = f"{candidate}: {type(e).__name__}: {e}"
+
+  return {
+    "ok": False,
+    "stage": "http",
+    "message": (
+      f"Port {port} is open on {host}, but this Python process cannot complete HTTP "
+      f"({last_error}). On macOS this usually means Local Network is blocked for Cursor. "
+      "FIX: quit the backend in Cursor, then double-click start_backend.command "
+      "(opens Terminal.app) — Safari can reach the phone, but Cursor often cannot. "
+      f"Also close tabs viewing {origin}, then Connect again from the dashboard."
+    ),
+    "detail": last_error,
+  }
+
+
+class _HttpFrameSource:
+  """Pull frames from IP Webcam via /shot.jpg (reliable) or MJPEG /video."""
+
+  def __init__(self, url: str, target_fps: int = 15):
+    self.url = url
+    self.target_fps = target_fps
+    self._opened = False
+    self._mode = None  # "shot" | "mjpeg"
+    self._mjpeg_resp = None
+    self._mjpeg_fp = None
+    self._boundary = None
+    self._lock = threading.Lock()
+
+  def open(self) -> Tuple[bool, Optional[str]]:
+    origin = _origin(self.url)
+    shot_url = f"{origin}/shot.jpg"
+    # Prefer single JPEG snapshots — far more reliable than OpenCV+MJPEG on macOS
+    err = self._try_shot(shot_url)
+    if err is None:
+      self.url = shot_url
+      self._mode = "shot"
+      self._opened = True
+      return True, None
+
+    err2 = self._try_mjpeg(self.url)
+    if err2 is None:
+      self._mode = "mjpeg"
+      self._opened = True
+      return True, None
+
+    return False, (
+      f"HTTP camera open failed. shot.jpg: {err}; mjpeg: {err2}"
+    )
+
+  def _try_shot(self, shot_url: str) -> Optional[str]:
+    try:
+      frame = self._download_jpeg(shot_url)
+      if frame is None:
+        return "empty/invalid JPEG"
+      return None
+    except Exception as e:
+      return f"{type(e).__name__}: {e}"
+
+  def _try_mjpeg(self, url: str) -> Optional[str]:
+    try:
+      req = urllib.request.Request(
+        url, headers={"User-Agent": HTTP_USER_AGENT}
+      )
+      resp = urllib.request.urlopen(req, timeout=8)
+      ctype = (resp.headers.get("Content-Type") or "").lower()
+      if "multipart" not in ctype and "image" not in ctype:
+        # Still try — some servers omit content-type
+        pass
+      boundary = None
+      if "boundary=" in ctype:
+        boundary = ctype.split("boundary=", 1)[1].strip().strip('"')
+      self._mjpeg_resp = resp
+      self._mjpeg_fp = resp
+      self._boundary = boundary
+      # Warm up one frame
+      frame = self._read_mjpeg_frame()
+      if frame is None:
+        self.close()
+        return "could not decode first MJPEG frame"
+      return None
+    except Exception as e:
+      self.close()
+      return f"{type(e).__name__}: {e}"
+
+  def _download_jpeg(self, url: str):
+    req = urllib.request.Request(
+      url, headers={"User-Agent": HTTP_USER_AGENT, "Connection": "close"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+      data = resp.read()
+    if not data:
+      return None
+    arr = cv2.imdecode(
+      np.frombuffer(data, dtype=np.uint8),
+      cv2.IMREAD_COLOR,
+    )
+    return arr
+
+  def _read_mjpeg_frame(self):
+    fp = self._mjpeg_fp
+    if fp is None:
+      return None
+
+    # Read until JPEG SOI/EOI markers
+    buf = b""
+    while True:
+      chunk = fp.read(4096)
+      if not chunk:
+        return None
+      buf += chunk
+      start = buf.find(b"\xff\xd8")
+      if start < 0:
+        if len(buf) > 256_000:
+          buf = buf[-64_000:]
+        continue
+      end = buf.find(b"\xff\xd9", start + 2)
+      if end < 0:
+        if len(buf) > 2_000_000:
+          buf = buf[start:]
+        continue
+      jpg = buf[start : end + 2]
+      buf = buf[end + 2 :]
+      frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+      return frame
+
+  def read(self):
+    """Returns (grabbed, frame) like VideoCapture.read()."""
+    if not self._opened:
+      return False, None
+    try:
+      if self._mode == "shot":
+        frame = self._download_jpeg(self.url)
+        return (frame is not None), frame
+      frame = self._read_mjpeg_frame()
+      return (frame is not None), frame
+    except Exception as e:
+      print(f"[PRODUCER] HTTP frame read error: {e}")
+      return False, None
+
+  def isOpened(self) -> bool:
+    return self._opened
+
+  def grab(self):
+    # No internal buffer to drain for shot mode
+    return True
+
+  def release(self):
+    self.close()
+
+  def close(self):
+    self._opened = False
+    if self._mjpeg_resp is not None:
+      try:
+        self._mjpeg_resp.close()
+      except Exception:
+        pass
+    self._mjpeg_resp = None
+    self._mjpeg_fp = None
+
 
 class CameraStream:
-  def __init__(self, src=0, target_fps=15, show_preview=True):
+  def __init__(self, src=0, target_fps=15, show_preview=True, soft_fail=True):
     """
     src=0 opens the default laptop webcam.
-    src="http://..." or "rtsp://..." opens a network camera stream.
+    src="http://..." opens a network camera stream (HTTP IP Webcam preferred).
+    soft_fail=True: failed open leaves camera inactive instead of raising.
     """
-    self.src = src
-    self.is_network_stream = isinstance(src, str) and ("://" in src)
-
-    self.stream = cv2.VideoCapture(src)
-    if not self.stream.isOpened():
-        raise RuntimeError(f"Failed to open camera with src={src}. Please check if the camera is connected or the index is correct.")
-    
-    # For network streams: minimize OpenCV's internal buffer so we always
-    # get the LATEST frame, not a stale frame from seconds ago.
-    if self.is_network_stream:
-        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"[PRODUCER] Network stream detected. Buffer minimized for real-time processing.")
-
     self.target_fps = target_fps
     self.show_preview = show_preview
     self.preview_enabled = show_preview
+    self.soft_fail = soft_fail
 
-    # THE MAGIC BUFFER: Holds exactly 16 items.
-    # When item 17 is added, item 1 is automatically pushed out.
     self.frame_buffer = deque(maxlen=CLIP_LENGTH)
-    
-    # Secondary buffer for high-res evidence (keeps the last ~4 seconds)
-    # This will be dynamically capped based on actual frame size to avoid OOM
     self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
     self.max_evidence_mb = 150
     self.evidence_buffer_initialized = False
 
     self._lock = threading.Lock()
+    self._thread = None
 
     self.frame_count = 0
     self.video_writer = None
+    self._recording_path = None
+    self.last_frame_time = None
+    self.open_error = None
+    self._prev_gray = None
+    self._person_box = None
+    self._person_detect_counter = 0
+    self.scene_meta = {
+        "suitable_for_model": True,
+        "subject_area_frac": 0.0,
+        "method": "full_frame",
+        "note": "",
+      }
 
-    # A flag to safely shut down the background thread
+    self.stream = None
+    self.src = src
+    self.is_network_stream = False
+    self.stopped = True
+
+    self._open_source(src)
+
+  def _open_source(self, src):
+    """Open capture for src. Returns True on success."""
+    if src is None:
+      self.src = None
+      self.is_network_stream = False
+      self.stream = None
+      self.stopped = True
+      self.open_error = None
+      return False
+
+    self.src = src
+    self.is_network_stream = _is_http_url(src) or (
+      isinstance(src, str) and "://" in src
+    )
+    self.open_error = None
+
+    if _is_http_url(src):
+      diag = diagnose_http_camera(src)
+      if not diag["ok"]:
+        self.stream = None
+        self.stopped = True
+        self.open_error = diag["message"]
+        print(f"[PRODUCER] {self.open_error}")
+        if not self.soft_fail:
+          raise RuntimeError(self.open_error)
+        return False
+
+      http_src = _HttpFrameSource(src, target_fps=self.target_fps)
+      ok, err = http_src.open()
+      if not ok:
+        self.stream = None
+        self.stopped = True
+        self.open_error = err or f"Failed to open HTTP camera {src}"
+        print(f"[PRODUCER] {self.open_error}")
+        if not self.soft_fail:
+          raise RuntimeError(self.open_error)
+        return False
+
+      self.stream = http_src
+      print(f"[PRODUCER] HTTP camera opened ({http_src._mode}) via {http_src.url}")
+      self.stopped = False
+      return True
+
+    # Local webcam / RTSP via OpenCV
+    stream = cv2.VideoCapture(src)
+    if not stream.isOpened():
+      stream.release()
+      self.stream = None
+      self.stopped = True
+      self.open_error = f"Failed to open camera with src={src}"
+      print(f"[PRODUCER] {self.open_error}")
+      if not self.soft_fail:
+        raise RuntimeError(self.open_error)
+      return False
+
+    self.stream = stream
+    if self.is_network_stream:
+      try:
+        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+      except Exception:
+        pass
+      print("[PRODUCER] Network stream detected (OpenCV). Buffer minimized.")
+
     self.stopped = False
-  
+    return True
+
   def start(self):
     """Starts the background thread to continuously read frames."""
+    if self.stream is None or not self.stream.isOpened():
+      print("[PRODUCER] Camera not open — start() skipped.")
+      return self
+    if self._thread is not None and self._thread.is_alive():
+      return self
+    self.stopped = False
     print("[PRODUCER] Starting camera thread...")
-    #daemon=True means this thread will automatically die when the main program closes
-    threading.Thread(target=self.update, args=(), daemon=True).start()
+    self._thread = threading.Thread(target=self.update, args=(), daemon=True)
+    self._thread.start()
     return self
-  
+
+  def restart(self, src):
+    """
+    Stop the current stream, open a new source, clear buffers, and start capturing.
+    Returns (success: bool, error: str | None).
+    """
+    print(f"[PRODUCER] Restarting camera with src={src}")
+    old_thread = self._thread
+    self.stop()
+    if old_thread is not None and old_thread.is_alive():
+      old_thread.join(timeout=2.0)
+
+    with self._lock:
+      self.frame_buffer.clear()
+      self.evidence_buffer.clear()
+      self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
+      self.evidence_buffer_initialized = False
+      self.frame_count = 0
+      self.last_frame_time = None
+      self.video_writer = None
+      self._recording_path = None
+      self._prev_gray = None
+      self._person_box = None
+      self._person_detect_counter = 0
+      self.scene_meta = {
+        "suitable_for_model": True,
+        "subject_area_frac": 0.0,
+        "method": "full_frame",
+        "note": "",
+      }
+
+    if not self._open_source(src):
+      return False, self.open_error
+
+    self.start()
+    return True, None
+
   def update(self):
     """This function runs on an infinite loop in the background."""
     sleep_time = 1.0 / self.target_fps
     consecutive_failures = 0
     max_consecutive_failures = 30
+    use_http = isinstance(self.stream, _HttpFrameSource)
 
     while not self.stopped:
       loop_start = time.perf_counter()
 
-      # For network streams: drain OpenCV's internal buffer by grabbing
-      # frames rapidly until we get the very latest one.
-      # Without this, .read() returns old buffered frames and the AI
-      # processes footage that is several seconds behind real-time.
-      if self.is_network_stream:
-          for _ in range(5):  # drain up to 5 stale frames
-              self.stream.grab()
-          grabbed, frame = self.stream.read()
-      else:
-          grabbed, frame = self.stream.read()
+      if self.stream is None or not self.stream.isOpened():
+        print("[PRODUCER] Stream closed unexpectedly.")
+        self.stop()
+        break
 
-      if not grabbed:
+      if use_http:
+        grabbed, frame = self.stream.read()
+      elif self.is_network_stream:
+        for _ in range(5):
+          self.stream.grab()
+        grabbed, frame = self.stream.read()
+      else:
+        grabbed, frame = self.stream.read()
+
+      if not grabbed or frame is None:
         consecutive_failures += 1
         wait_time = min(2 ** (consecutive_failures - 1), 30)
-        print(f"[PRODUCER] Frame grab failed ({consecutive_failures}/{max_consecutive_failures}). Retrying in {wait_time}s...")
+        print(
+          f"[PRODUCER] Frame grab failed ({consecutive_failures}/"
+          f"{max_consecutive_failures}). Retrying in {wait_time}s..."
+        )
         if consecutive_failures >= max_consecutive_failures:
-            print("[PRODUCER] Camera disconnected. Too many failures. Giving up.")
-            self.stop()
-            break
+          print("[PRODUCER] Camera disconnected. Too many failures. Giving up.")
+          self.stop()
+          break
         time.sleep(wait_time)
         continue
-      
+
       consecutive_failures = 0
 
-      # Initialize evidence buffer size dynamically based on frame size
       if not self.evidence_buffer_initialized:
-          frame_bytes = frame.nbytes
-          max_frames = int((self.max_evidence_mb * 1024 * 1024) / frame_bytes)
-          max_frames = max(max_frames, CLIP_LENGTH) # Ensure we always keep at least one clip
-          self.evidence_buffer = deque(maxlen=max_frames)
-          self.evidence_buffer_initialized = True
-          print(f"[PRODUCER] Evidence buffer capped at {max_frames} frames ({self.max_evidence_mb} MB)")
+        frame_bytes = frame.nbytes
+        max_frames = int((self.max_evidence_mb * 1024 * 1024) / frame_bytes)
+        max_frames = max(max_frames, CLIP_LENGTH)
+        self.evidence_buffer = deque(maxlen=max_frames)
+        self.evidence_buffer_initialized = True
+        print(
+          f"[PRODUCER] Evidence buffer capped at {max_frames} frames "
+          f"({self.max_evidence_mb} MB)"
+        )
 
-      # 1. PRE-PROCESS IMMEDIATELY: Resize to 112x112 to save laptop RAM
-      frame_resized = cv2.resize(frame, (112, 112))
-
-      frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+      # Crop/zoom toward people/motion so 112x112 isn't empty hallway,
+      # and track whether subjects are large enough for this model.
+      # HOG person detect is expensive — run every 10 frames.
+      self._person_detect_counter = (self._person_detect_counter + 1) % 10
+      run_hog = self._person_detect_counter == 1
+      frame_rgb, scene_meta, self._prev_gray, self._person_box = prepare_for_model(
+        frame,
+        self._prev_gray,
+        person_box_cache=self._person_box,
+        run_person_detector=run_hog,
+      )
 
       with self._lock:
-         self.frame_buffer.append(frame_rgb)
-         self.evidence_buffer.append(frame) # Keep raw BGR frame for high-res evidence
-         self.frame_count += 1
-         
-         if self.video_writer is not None:
-             self.video_writer.write(frame)
-      
-      # For local webcams, pace the loop. For network streams, the network
-      # itself is the natural rate limiter — no need to add artificial delay.
-      if not self.is_network_stream:
-          elapsed = time.perf_counter() - loop_start
-          remaining = sleep_time - elapsed
-          if remaining > 0:
-              time.sleep(remaining)
-  
+        self.frame_buffer.append(frame_rgb)
+        self.evidence_buffer.append(frame)
+        self.frame_count += 1
+        self.last_frame_time = time.time()
+        self.scene_meta = scene_meta
+
+        if self.video_writer is not None:
+          self.video_writer.write(frame)
+
+      # Pace both local and HTTP snapshot mode
+      elapsed = time.perf_counter() - loop_start
+      remaining = sleep_time - elapsed
+      if remaining > 0:
+        time.sleep(remaining)
+
   def get_buffer(self):
-    """The AI will call this function whenever it is ready for a new batch of 16 frames"""
-    # We return a standard list copy of the buffer to prevent thread-collision errors
     with self._lock:
       return list(self.frame_buffer)
-      
+
   def get_evidence_buffer(self):
-    """Returns the recent high-res frames for saving as evidence"""
     with self._lock:
       return list(self.evidence_buffer)
 
   def get_snapshot(self):
-    """
-    Atomically returns the inference buffer (small, model-ready), the
-    evidence buffer (full-res), and the frame count at the exact same moment in time.
-    Prevents the race condition where new frames arrive between two separate calls.
-    """
     with self._lock:
-        return list(self.frame_buffer), list(self.evidence_buffer), self.frame_count
+      return list(self.frame_buffer), list(self.evidence_buffer), self.frame_count
+
+  def get_scene_meta(self):
+    with self._lock:
+      return dict(self.scene_meta)
+
+  def get_last_frame_age_ms(self):
+    with self._lock:
+      if self.last_frame_time is None:
+        return None
+      return round((time.time() - self.last_frame_time) * 1000, 1)
 
   def get_latest_frame_jpeg(self):
-    """
-    Returns the latest high-res frame as JPEG bytes for browser preview.
-    Returns None if no frames have been captured yet.
-    """
     with self._lock:
-        if len(self.evidence_buffer) == 0:
-            return None
-        frame = self.evidence_buffer[-1]  # latest raw BGR frame
-    # Encode outside the lock so we don't block the camera thread
-    _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+      if len(self.evidence_buffer) == 0:
+        return None
+      frame = self.evidence_buffer[-1]
+    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return jpeg.tobytes()
 
   def start_recording(self, filename):
-      """Starts writing the evidence buffer and subsequent live frames to a file."""
-      with self._lock:
-          if self.video_writer is not None:
-              return
-          
-          if not self.evidence_buffer:
-              return
+    with self._lock:
+      if self.video_writer is not None:
+        return
 
-          height, width = self.evidence_buffer[0].shape[:2]
-          fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-          self.video_writer = cv2.VideoWriter(filename, fourcc, self.target_fps, (width, height))
-          
-          # Write the pre-incident buffer so we have the context leading up to the event
-          for f in self.evidence_buffer:
-              self.video_writer.write(f)
+      if not self.evidence_buffer:
+        return
+
+      height, width = self.evidence_buffer[0].shape[:2]
+      # Record with mp4v (reliable in OpenCV); transcode to H.264 on stop for browsers.
+      fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+      self.video_writer = cv2.VideoWriter(
+        filename, fourcc, self.target_fps, (width, height)
+      )
+      if not self.video_writer.isOpened():
+        self.video_writer = None
+        print(f"[PRODUCER] Failed to open VideoWriter for {filename}")
+        return
+
+      self._recording_path = filename
+      for f in self.evidence_buffer:
+        self.video_writer.write(f)
 
   def stop_recording(self):
-      """Stops the current recording."""
-      with self._lock:
-          if self.video_writer is not None:
-              self.video_writer.release()
-              self.video_writer = None
+    path = None
+    with self._lock:
+      if self.video_writer is not None:
+        self.video_writer.release()
+        self.video_writer = None
+        path = self._recording_path
+        self._recording_path = None
+
+    if path:
+      try:
+        from evidence_video import make_browser_compatible
+
+        make_browser_compatible(path)
+      except Exception as e:
+        print(f"[PRODUCER] Evidence browser transcode skipped: {e}")
 
   def get_frame_count(self):
-     """Returns the total number of frames captured so far"""
-     with self._lock:
-        return self.frame_count
+    with self._lock:
+      return self.frame_count
+
+  def is_active(self):
+    """True when producer thread should be running and stream is open."""
+    return (
+      not self.stopped
+      and self.stream is not None
+      and self.stream.isOpened()
+    )
 
   def stop(self):
-    """Releases the camera hardware."""
+    """Stops the producer thread and releases the camera hardware."""
     self.stopped = True
     self.stop_recording()
-    if getattr(self, 'stream', None) and self.stream.isOpened():
-        self.stream.release()
-    cv2.destroyAllWindows()
+    if getattr(self, "stream", None) is not None:
+      try:
+        if hasattr(self.stream, "release"):
+          self.stream.release()
+        elif hasattr(self.stream, "close"):
+          self.stream.close()
+      except Exception:
+        pass
+      self.stream = None
+    self._thread = None
 
-# ==========================================
-# TESTING BLOCK (Runs only if you execute this file directly)
-# ==========================================
+
 if __name__ == "__main__":
-    # 1. Initialize and start the camera in the background
-    cam = CameraStream(src=0, target_fps=6, show_preview=True).start()
-    
-    # Give the camera a second to warm up
-    time.sleep(1) 
-    
-    try:
-        # 2. The Main Loop (Simulating the AI waiting for data)
-        while True:
-            current_buffer = cam.get_buffer()
-            
-            # Only print if the buffer is completely full (ready for the AI)
-            if len(current_buffer) == CLIP_LENGTH:
-                print(f"✅ Buffer Full: {len(current_buffer)} frames ready. Shape of one frame: {current_buffer[0].shape} | Total captured: {cam.get_frame_count()}")
-            else:
-                print(f"⏳ Buffering... {len(current_buffer)}/{CLIP_LENGTH} frames")
-                
-            time.sleep(1) # Check the buffer every 1 second
-            
-    except KeyboardInterrupt:
-        print("\n[SYSTEM] Shutting down...")
-        cam.stop()
+  cam = CameraStream(src=0, target_fps=6, show_preview=True, soft_fail=False).start()
+
+  time.sleep(1)
+
+  try:
+    while True:
+      current_buffer = cam.get_buffer()
+
+      if len(current_buffer) == CLIP_LENGTH:
+        print(
+          f"✅ Buffer Full: {len(current_buffer)} frames ready. "
+          f"Shape of one frame: {current_buffer[0].shape} | "
+          f"Total captured: {cam.get_frame_count()}"
+        )
+      else:
+        print(f"⏳ Buffering... {len(current_buffer)}/{CLIP_LENGTH} frames")
+
+      time.sleep(1)
+
+  except KeyboardInterrupt:
+    print("\n[SYSTEM] Shutting down...")
+    cam.stop()
