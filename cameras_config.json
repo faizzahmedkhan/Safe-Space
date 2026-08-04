@@ -1,0 +1,35 @@
+{
+  "webcam-33": {
+    "ip": "",
+    "port": 8080,
+    "path": "/video",
+    "wifi_name": "Local webcam",
+    "stream_url": null,
+    "capture_url": null,
+    "via_bridge": false,
+    "source": "webcam",
+    "label": "Laptop Webcam"
+  },
+  "Phon-1": {
+    "ip": "192.168.100.171",
+    "port": 8080,
+    "path": "/video",
+    "wifi_name": "",
+    "stream_url": null,
+    "capture_url": null,
+    "via_bridge": false,
+    "source": "phone",
+    "label": "Phon-1"
+  },
+  "2": {
+    "ip": "192.168.100.251",
+    "port": 8080,
+    "path": "/video",
+    "wifi_name": "",
+    "stream_url": null,
+    "capture_url": null,
+    "via_bridge": false,
+    "source": "phone",
+    "label": "2"
+  }
+}

@@ -4,8 +4,8 @@ export function getApiUrl(): string {
   return API_URL.replace(/\/$/, "");
 }
 
-export function feedUrl(): string {
-  return `${getApiUrl()}/feed`;
+export function feedUrl(cameraId: string): string {
+  return `${getApiUrl()}/cameras/${cameraId}/feed`;
 }
 
 export function evidenceUrl(pathOrName: string): string {
@@ -14,6 +14,8 @@ export function evidenceUrl(pathOrName: string): string {
 }
 
 export type StatusResponse = {
+  camera_id: string;
+  label: string;
   backend_online: boolean;
   camera_active: boolean;
   camera_receiving: boolean;
@@ -42,11 +44,17 @@ export type StatusResponse = {
   };
 };
 
+export type CamerasResponse = {
+  total: number;
+  cameras: StatusResponse[];
+};
+
 export type AlertItem = {
   timestamp: string;
   confidence: number;
   evidence_file: string;
   evidence_url?: string | null;
+  camera_id?: string;
 };
 
 export type LogItem = {
@@ -78,17 +86,24 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
-export async function fetchStatus(): Promise<StatusResponse> {
-  const res = await fetch(`${getApiUrl()}/status`, { cache: "no-store" });
+export async function fetchCameras(): Promise<CamerasResponse> {
+  const res = await fetch(`${getApiUrl()}/cameras`, { cache: "no-store" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
 
-export async function fetchAlerts(): Promise<{
+export async function fetchStatus(cameraId: string): Promise<StatusResponse> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/status`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchAlerts(cameraId?: string): Promise<{
   total_alerts: number;
   recent: AlertItem[];
 }> {
-  const res = await fetch(`${getApiUrl()}/alerts`, { cache: "no-store" });
+  const url = cameraId ? `${getApiUrl()}/alerts?camera_id=${cameraId}` : `${getApiUrl()}/alerts`;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
@@ -99,8 +114,26 @@ export async function fetchLogs(): Promise<{ total: number; recent: LogItem[] }>
   return res.json();
 }
 
-export async function connectCamera(payload: ConnectPayload): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/camera/connect`, {
+export async function createCamera(cameraId: string, label: string): Promise<{ ok: boolean; camera_id: string }> {
+  const res = await fetch(`${getApiUrl()}/cameras`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ camera_id: cameraId, label }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function deleteCamera(cameraId: string): Promise<unknown> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function connectCamera(cameraId: string, payload: ConnectPayload): Promise<unknown> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -109,8 +142,8 @@ export async function connectCamera(payload: ConnectPayload): Promise<unknown> {
   return res.json();
 }
 
-export async function connectWebcam(): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/camera/connect-webcam`, {
+export async function connectWebcam(cameraId: string): Promise<unknown> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect-webcam`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
@@ -119,8 +152,8 @@ export async function connectWebcam(): Promise<unknown> {
   return res.json();
 }
 
-export async function disconnectCamera(): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/camera/disconnect`, {
+export async function disconnectCamera(cameraId: string): Promise<unknown> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/disconnect`, {
     method: "POST",
   });
   if (!res.ok) throw new Error(await readError(res));

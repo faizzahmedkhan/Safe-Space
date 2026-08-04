@@ -69,53 +69,12 @@ def make_browser_compatible(path: str) -> bool:
         return False
 
 
-def ensure_browser_compatible(path: str, marker_dir: Optional[str] = None) -> str:
-    """
-    Ensure path is browser-playable. Uses a sidecar .web.mp4 cache when possible
-    so originals can remain, but prefers in-place conversion for simplicity.
-    """
-    if not os.path.isfile(path):
-        return path
-
-    # Sidecar next to file: incident_x.web.mp4
-    root, ext = os.path.splitext(path)
-    web_path = f"{root}.web{ext}"
-
-    if os.path.isfile(web_path) and os.path.getsize(web_path) > 1000:
-        # Refresh if source is newer
-        if os.path.getmtime(web_path) >= os.path.getmtime(path):
-            return web_path
-
-    # Convert original into sidecar (keep original for download/debug)
-    ffmpeg = _ffmpeg_exe()
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        path,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-movflags",
-        "+faststart",
-        web_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode == 0 and os.path.isfile(web_path) and os.path.getsize(web_path) > 1000:
-        print(f"[EVIDENCE] Browser copy ready: {web_path}")
-        return web_path
-
-    # Fall back to in-place conversion
-    make_browser_compatible(path)
-    return path
+# NOTE: ensure_browser_compatible() used to live here and was called by
+# GET /evidence/{filename}. It has been removed: make_browser_compatible()
+# above already converts each clip to H.264 in place when recording stops, so
+# that second pass only ever re-encoded an already-playable file into a
+# redundant .web.mp4 sidecar — doubling storage for every clip ever viewed.
+# It also wrote straight to its output path with no temp-then-rename, so two
+# concurrent requests (a HEAD plus a ranged GET, which browsers routinely
+# issue for <video>) could interleave writes and permanently cache a corrupt
+# file. Serve the original directly instead.

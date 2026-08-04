@@ -15,7 +15,7 @@ from camera import CLIP_LENGTH
 from frame_prep import prepare_for_model
 
 INFERENCE_STRIDE = 8
-SCORE_HISTORY_LEN = 6
+SCORE_HISTORY_LEN = 10
 KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
 KINETICS_STD = [0.22803, 0.22145, 0.216989]
 
@@ -104,7 +104,12 @@ def analyze_video_file(
             score_history.append(raw)
 
             smoothed = None
-            if len(score_history) == SCORE_HISTORY_LEN:
+            # Adaptive smoothing: for offline analysis of short evidence clips,
+            # we can't wait for the full SCORE_HISTORY_LEN window (a 3-second
+            # clip only yields ~5 predictions). Start computing smoothed as
+            # soon as we have enough predictions for a meaningful average.
+            min_for_smoothed = min(3, SCORE_HISTORY_LEN)
+            if len(score_history) >= min_for_smoothed:
                 smoothed = float(sum(score_history) / len(score_history))
                 peak_smoothed = max(peak_smoothed, smoothed)
                 # Only count alerts when framing is suitable

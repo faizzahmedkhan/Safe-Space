@@ -2,6 +2,7 @@ import cv2
 import time
 import threading
 import socket
+import http.client
 import urllib.request
 import urllib.error
 import numpy as np
@@ -109,6 +110,15 @@ class _HttpFrameSource:
     self._mjpeg_fp = None
     self._boundary = None
     self._lock = threading.Lock()
+    # Persistent keep-alive connection for "shot" mode. Without this, every
+    # single frame paid a fresh TCP+HTTP handshake (urllib defaulted to
+    # "Connection: close"), which is the dominant source of per-frame
+    # latency for phone cameras on Wi-Fi, and gets worse linearly with more
+    # phone cameras attached. One connection is reused for the life of this
+    # source and only rebuilt if the server drops it.
+    self._conn = None
+    self._conn_host = None
+    self._conn_port = None
 
   def open(self) -> Tuple[bool, Optional[str]]:
     origin = _origin(self.url)
@@ -119,12 +129,24 @@ class _HttpFrameSource:
       self.url = shot_url
       self._mode = "shot"
       self._opened = True
+      # Warmup/drain stale frames from phone buffer
+      for _ in range(5):
+        try:
+          self._download_jpeg(shot_url)
+        except Exception:
+          pass
       return True, None
 
     err2 = self._try_mjpeg(self.url)
     if err2 is None:
       self._mode = "mjpeg"
       self._opened = True
+      # Warmup/drain stale frames
+      for _ in range(5):
+        try:
+          self._read_mjpeg_frame()
+        except Exception:
+          pass
       return True, None
 
     return False, (
@@ -166,11 +188,52 @@ class _HttpFrameSource:
       self.close()
       return f"{type(e).__name__}: {e}"
 
+  def _ensure_conn(self, url: str):
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if self._conn is None or self._conn_host != host or self._conn_port != port:
+      self._close_conn()
+      cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+      self._conn = cls(host, port, timeout=5)
+      self._conn_host = host
+      self._conn_port = port
+    return parsed
+
+  def _close_conn(self):
+    if self._conn is not None:
+      try:
+        self._conn.close()
+      except Exception:
+        pass
+    self._conn = None
+    self._conn_host = None
+    self._conn_port = None
+
+  def _request_path(self, parsed) -> str:
+    path = parsed.path or "/"
+    if parsed.query:
+      path += "?" + parsed.query
+    return path
+
   def _download_jpeg(self, url: str):
-    req = urllib.request.Request(
-      url, headers={"User-Agent": HTTP_USER_AGENT, "Connection": "close"}
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    parsed = self._ensure_conn(url)
+    path = self._request_path(parsed)
+    headers = {"User-Agent": HTTP_USER_AGENT, "Connection": "keep-alive"}
+    try:
+      self._conn.request("GET", path, headers=headers)
+      resp = self._conn.getresponse()
+      data = resp.read()
+    except Exception:
+      # Server likely closed the keep-alive connection (idle timeout, etc).
+      # Reopen once and retry before giving up — this keeps the fast path
+      # (reused connection) as the common case without failing hard on the
+      # occasional server-side close.
+      self._close_conn()
+      parsed = self._ensure_conn(url)
+      path = self._request_path(parsed)
+      self._conn.request("GET", path, headers=headers)
+      resp = self._conn.getresponse()
       data = resp.read()
     if not data:
       return None
@@ -240,6 +303,7 @@ class _HttpFrameSource:
         pass
     self._mjpeg_resp = None
     self._mjpeg_fp = None
+    self._close_conn()
 
 
 class CameraStream:
@@ -258,6 +322,16 @@ class CameraStream:
     self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
     self.max_evidence_mb = 150
     self.evidence_buffer_initialized = False
+
+    # Rolling actual-fps measurement. target_fps is what we *ask* for; this
+    # tracks what we're *actually* sustaining. The capture loop's own pacing
+    # (time.sleep(remaining)) silently degrades to whatever fps a struggling
+    # camera can sustain with no correction and no signal anywhere — this
+    # makes that visible instead of silent, since a camera running well
+    # under its target fps feeds the model clips that span more real-world
+    # time than the model was trained on (quiet accuracy drift, not a crash).
+    self._loop_timestamps = deque(maxlen=30)
+    self._fps_warn_counter = 0
 
     self._lock = threading.Lock()
     self._thread = None
@@ -381,6 +455,8 @@ class CameraStream:
       self.evidence_buffer_initialized = False
       self.frame_count = 0
       self.last_frame_time = None
+      self._loop_timestamps.clear()
+      self._fps_warn_counter = 0
       self.video_writer = None
       self._recording_path = None
       self._prev_gray = None
@@ -467,10 +543,25 @@ class CameraStream:
         self.evidence_buffer.append(frame)
         self.frame_count += 1
         self.last_frame_time = time.time()
+        self._loop_timestamps.append(self.last_frame_time)
         self.scene_meta = scene_meta
 
         if self.video_writer is not None:
           self.video_writer.write(frame)
+
+      # Every ~30 frames, check whether we're actually keeping pace with
+      # target_fps. This never blocks or corrects anything — pacing stays
+      # as-is — it just surfaces drift that was previously invisible.
+      self._fps_warn_counter += 1
+      if self._fps_warn_counter >= 30:
+        self._fps_warn_counter = 0
+        actual = self.get_actual_fps()
+        if actual is not None and actual < 0.8 * self.target_fps:
+          print(
+            f"[PRODUCER] fps drift: sustaining {actual:.1f}fps vs "
+            f"target {self.target_fps}fps — clips will span more real time "
+            f"than expected."
+          )
 
       # Pace both local and HTTP snapshot mode
       elapsed = time.perf_counter() - loop_start
@@ -499,6 +590,34 @@ class CameraStream:
       if self.last_frame_time is None:
         return None
       return round((time.time() - self.last_frame_time) * 1000, 1)
+
+  def get_actual_fps(self):
+    """Rolling fps measured from real frame-arrival timestamps (last ~30 frames)."""
+    with self._lock:
+      ts = list(self._loop_timestamps)
+    if len(ts) < 2:
+      return None
+    span = ts[-1] - ts[0]
+    if span <= 0:
+      return None
+    return round((len(ts) - 1) / span, 2)
+
+  def set_evidence_budget_mb(self, max_evidence_mb: float):
+    """
+    Update the memory ceiling for the evidence buffer, resizing it in place
+    if it's already running. Used to keep TOTAL evidence memory roughly
+    constant regardless of how many cameras are attached (each camera's
+    share shrinks as more cameras join), rather than every camera
+    independently claiming up to max_evidence_mb of its own.
+    """
+    with self._lock:
+      self.max_evidence_mb = max_evidence_mb
+      if self.evidence_buffer_initialized and len(self.evidence_buffer) > 0:
+        frame_bytes = self.evidence_buffer[0].nbytes
+        max_frames = int((max_evidence_mb * 1024 * 1024) / frame_bytes)
+        max_frames = max(max_frames, CLIP_LENGTH)
+        trimmed = list(self.evidence_buffer)[-max_frames:]
+        self.evidence_buffer = deque(trimmed, maxlen=max_frames)
 
   def get_latest_frame_jpeg(self):
     with self._lock:

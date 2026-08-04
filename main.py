@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ import json
 import re
 from datetime import datetime
 from contextlib import asynccontextmanager
+from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
@@ -20,28 +22,28 @@ import shutil
 from collections import deque
 from camera import CameraStream, CLIP_LENGTH, diagnose_http_camera
 from bridge_ctl import ensure_lan_bridge
-from evidence_video import ensure_browser_compatible
 from video_analyze import analyze_video_file
-
-# --- HARDWARE SETTINGS ---
-# Do NOT auto-open the laptop webcam — connect from the dashboard so the UI
-# matches the real source (phone IP Webcam vs laptop).
-CAMERA_SOURCE = None
 
 # --- THRESHOLDS & TIMINGS ---
 INFERENCE_STRIDE = 8
 ALERT_THRESHOLD = 0.75
 ALERT_COOLDOWN_SECONDS = 5
-SCORE_HISTORY_LEN = 6
+SCORE_HISTORY_LEN = 10
 MAX_ALERTS = 500
 MAX_LOGS = 200
 FRAME_STALE_MS = 2000
+CAMERA_TARGET_FPS = 15
+# Total evidence-buffer RAM budget shared across ALL cameras, not per camera.
+# Each camera's individual cap shrinks as more cameras join, so total memory
+# stays roughly constant (e.g. ~300MB total) instead of growing linearly
+# with camera count (which is what a flat per-camera cap would do).
+TOTAL_EVIDENCE_BUDGET_MB = 300
 
 KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
 KINETICS_STD = [0.22803, 0.22145, 0.216989]
 
 ALERTS_FILE = "alerts.json"
-DEVICE_CONFIG_FILE = "device_config.json"
+CAMERAS_CONFIG_FILE = "cameras_config.json"
 EVIDENCE_DIR = "evidence"
 UPLOADS_DIR = "uploads"
 DATA_SAFE = os.path.join("data", "safe")
@@ -49,13 +51,6 @@ DATA_UNSAFE = os.path.join("data", "unsafe")
 
 alert_log: list[dict] = []
 system_logs: deque = deque(maxlen=MAX_LOGS)
-device_config: dict = {
-    "ip": "",
-    "port": 8080,
-    "path": "/video",
-    "wifi_name": "",
-    "stream_url": None,
-}
 
 
 def _now_iso() -> str:
@@ -84,28 +79,91 @@ def _save_alerts_atomic(alerts: list, path: str) -> None:
         add_log(f"Could not persist alerts: {e}", level="error", kind="system")
 
 
-def _save_device_config(config: dict) -> None:
+# ==========================================
+# 0. CAMERA MANAGER
+# ==========================================
+# Each entry in `cameras` is one independently-running CameraStream plus the
+# per-camera bookkeeping that used to be a handful of module-level globals
+# (device_config, score_history, alert_active, ...). Every camera captures on
+# its own background thread exactly as before — nothing about CameraStream
+# itself changed. The only new piece is that we now keep a dict of them
+# instead of a single `cam` variable, and ai_watcher() below sweeps all of
+# them once per cycle.
+_cameras_lock = threading.Lock()
+cameras: dict[str, dict] = {}
+
+
+def _default_camera_config() -> dict:
+    return {
+        "ip": "",
+        "port": 8080,
+        "path": "/video",
+        "wifi_name": "",
+        "stream_url": None,
+        "capture_url": None,
+        "via_bridge": False,
+        "source": "none",
+        "label": "",
+    }
+
+
+def _new_camera_slot(camera_id: str, label: str = "") -> dict:
+    return {
+        "camera_id": camera_id,
+        "stream": CameraStream(src=None, target_fps=CAMERA_TARGET_FPS, show_preview=False, soft_fail=True),
+        "config": {**_default_camera_config(), "label": label or camera_id},
+        "score_history": deque(maxlen=SCORE_HISTORY_LEN),
+        "alert_active": False,
+        "last_processed_frame_count": 0,
+        "warmup_remaining": 12,
+        "consecutive_above": 0,
+    }
+
+
+def get_camera_or_404(camera_id: str) -> dict:
+    slot = cameras.get(camera_id)
+    if slot is None:
+        raise HTTPException(status_code=404, detail=f"Unknown camera_id '{camera_id}'.")
+    return slot
+
+
+def _save_cameras_config() -> None:
+    payload = {cid: slot["config"] for cid, slot in cameras.items()}
     try:
         with tempfile.NamedTemporaryFile("w", dir=".", delete=False, suffix=".tmp") as tmp:
-            json.dump(config, tmp, indent=2)
+            json.dump(payload, tmp, indent=2)
             tmp_path = tmp.name
-        os.replace(tmp_path, DEVICE_CONFIG_FILE)
+        os.replace(tmp_path, CAMERAS_CONFIG_FILE)
     except Exception as e:
-        add_log(f"Could not persist device config: {e}", level="error", kind="system")
+        add_log(f"Could not persist camera config: {e}", level="error", kind="system")
 
 
-def _load_device_config() -> dict:
-    if not os.path.exists(DEVICE_CONFIG_FILE):
-        return dict(device_config)
+def _load_cameras_config() -> dict:
+    if not os.path.exists(CAMERAS_CONFIG_FILE):
+        return {}
     try:
-        with open(DEVICE_CONFIG_FILE, "r") as f:
-            loaded = json.load(f)
-        merged = dict(device_config)
-        merged.update(loaded)
-        return merged
+        with open(CAMERAS_CONFIG_FILE, "r") as f:
+            return json.load(f)
     except Exception as e:
-        add_log(f"Could not load device config: {e}", level="error", kind="system")
-        return dict(device_config)
+        add_log(f"Could not load camera config: {e}", level="error", kind="system")
+        return {}
+
+
+def _rebalance_evidence_budgets() -> None:
+    """Re-split TOTAL_EVIDENCE_BUDGET_MB evenly across whatever cameras exist
+    right now. Call this any time a camera is added or removed."""
+    n = max(1, len(cameras))
+    per_camera_mb = TOTAL_EVIDENCE_BUDGET_MB / n
+    for slot in cameras.values():
+        slot["stream"].set_evidence_budget_mb(per_camera_mb)
+
+
+def build_stream_url(ip: str, port: int = 8080, path: str = "/video") -> str:
+    ip = ip.strip()
+    path = path.strip() or "/video"
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"http://{ip}:{port}{path}"
 
 
 if os.path.exists(ALERTS_FILE):
@@ -114,9 +172,6 @@ if os.path.exists(ALERTS_FILE):
             alert_log = json.load(f)
     except Exception as e:
         print(f"[SYSTEM] Could not load past alerts: {e}")
-
-device_config = _load_device_config()
-score_history: deque = deque(maxlen=SCORE_HISTORY_LEN)
 
 # ==========================================
 # 1. LOAD THE BRAIN (System Startup)
@@ -143,153 +198,194 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(DATA_SAFE, exist_ok=True)
 os.makedirs(DATA_UNSAFE, exist_ok=True)
 
-# Soft-start: only auto-reconnect a previously saved phone URL
-_initial_src = device_config.get("stream_url") or CAMERA_SOURCE
-cam = CameraStream(src=_initial_src, target_fps=15, show_preview=False, soft_fail=True)
-if _initial_src is None:
-    add_log(
-        "Camera idle at startup. Connect a phone or laptop webcam from the dashboard.",
-        kind="camera",
-    )
-elif cam.stream is not None:
-    cam.start()
-    add_log(f"Camera started with src={_initial_src}", kind="camera")
+# Soft-start: re-create any cameras that were connected last time we ran,
+# and try to auto-reconnect ones that had a saved phone stream_url.
+_persisted_cameras = _load_cameras_config()
+if not _persisted_cameras:
+    add_log("No cameras configured yet. Add one from the dashboard.", kind="camera")
 else:
-    add_log(
-        f"Camera not connected at startup ({cam.open_error}). Use the dashboard to connect.",
-        level="warning",
-        kind="camera",
-    )
+    for _camera_id, _cfg in _persisted_cameras.items():
+        slot = _new_camera_slot(_camera_id, label=_cfg.get("label", _camera_id))
+        slot["config"] = {**_default_camera_config(), **_cfg}
+        cameras[_camera_id] = slot
 
+        _src = slot["config"].get("capture_url") or slot["config"].get("stream_url")
+        if slot["config"].get("source") == "webcam":
+            _src = 0
+        if _src is None:
+            add_log(f"[{_camera_id}] Idle at startup. Connect from the dashboard.", kind="camera")
+            continue
 
-def build_stream_url(ip: str, port: int = 8080, path: str = "/video") -> str:
-    ip = ip.strip()
-    path = path.strip() or "/video"
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"http://{ip}:{port}{path}"
+        ok, err = slot["stream"].restart(_src)
+        if ok:
+            add_log(f"[{_camera_id}] Camera started with src={_src}", kind="camera")
+        else:
+            add_log(f"[{_camera_id}] Not connected at startup ({err}). Use the dashboard.", level="warning", kind="camera")
+
+_rebalance_evidence_budgets()
 
 
 # ==========================================
 # 2. THE CONSUMER LOOP (Background Worker)
 # ==========================================
-async def ai_watcher():
-    print("[AI WATCHER] Online. Waiting for the camera buffer to fill...")
+def _handle_camera_score(camera_id: str, slot: dict, current_prob: float, scene: dict) -> None:
+    """Same alert/recording state machine as before, just scoped to one camera_id."""
+    stream = slot["stream"]
+    score_history = slot["score_history"]
 
-    last_processed_frame_count = 0
-    alert_active = False
-    INFERENCE_SLEEP = INFERENCE_STRIDE / cam.target_fps
+    if len(score_history) < score_history.maxlen:
+        print(f"[WARMUP][{camera_id}] {len(score_history)}/{score_history.maxlen} predictions. Raw: {current_prob*100:.1f}%")
+        return
+
+    avg_prob = sum(score_history) / len(score_history)
+    suitable = scene.get("suitable_for_model", True)
+    print(
+        f"[{camera_id}] Stats -> [Raw Spike: {current_prob*100:.1f}%] | "
+        f"[SMOOTHED AVG: {avg_prob*100:.1f}%] | "
+        f"[scene: {scene.get('method')} subject={scene.get('subject_area_frac')} suitable={suitable}]"
+    )
+
+    if avg_prob >= ALERT_THRESHOLD and not suitable:
+        if slot["alert_active"]:
+            stream.stop_recording()
+            add_log(f"[{camera_id}] Recording stopped — scene unsuitable for model framing.", kind="recording")
+            slot["alert_active"] = False
+        slot["consecutive_above"] = 0
+        print(f"⚠️ [{camera_id}] Score high but subjects too small/far — alert suppressed.")
+        return
+
+    if avg_prob >= ALERT_THRESHOLD:
+        slot["consecutive_above"] = slot.get("consecutive_above", 0) + 1
+        # Require 2 consecutive above-threshold cycles to trigger an alert.
+        # This filters transient false-positive spikes (e.g. sitting with
+        # minor movements that the motion crop amplifies).
+        if slot["consecutive_above"] >= 2 and not slot["alert_active"]:
+            slot["alert_active"] = True
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"{EVIDENCE_DIR}/incident_{camera_id}_{timestamp}.mp4"
+
+            stream.start_recording(filename)
+            add_log(
+                f"[{camera_id}] ALERT: Physical altercation detected ({avg_prob*100:.1f}%). Recording {filename}",
+                level="alert",
+                kind="alert",
+            )
+
+            global alert_log
+            alert_log.append(
+                {
+                    "camera_id": camera_id,
+                    "timestamp": timestamp,
+                    "confidence": round(avg_prob * 100, 1),
+                    "evidence_file": filename,
+                    "scene": scene,
+                }
+            )
+            if len(alert_log) > MAX_ALERTS:
+                alert_log = alert_log[-MAX_ALERTS:]
+            _save_alerts_atomic(alert_log, ALERTS_FILE)
+        return
+
+    # Score dropped below threshold
+    slot["consecutive_above"] = 0
+    if slot["alert_active"]:
+        stream.stop_recording()
+        add_log(f"[{camera_id}] Evidence recording stopped.", kind="recording")
+        slot["alert_active"] = False
+    print(f"✅ [{camera_id}] Safe.")
+
+
+def _run_inference_batch(batch: torch.Tensor) -> torch.Tensor:
+    """Blocking model call, meant to be run via asyncio.to_thread so it
+    doesn't stall the event loop that also serves your async endpoints
+    (e.g. /analyze/video). As camera count grows, batches get bigger and
+    this call takes longer — without to_thread, every concurrent request
+    would queue behind it on the same thread."""
+    with torch.no_grad():
+        outputs = model(batch)
+        return F.softmax(outputs, dim=1)
+
+
+async def ai_watcher():
+    """
+    One consumer loop for every camera. Each cycle:
+      1. Snapshot every camera's buffer.
+      2. Collect the ones that are full AND due for inference (stride reached)
+         into a single batch — however many that is (0..N).
+      3. Run ONE model() forward pass on that batch (still works fine on CPU;
+         batching doesn't require a GPU, it just amortizes per-call overhead
+         and keeps the code simple as camera count grows).
+      4. Fan results back out to each camera's own score history / alert logic.
+    Cameras that aren't ready this cycle are simply skipped — nobody blocks
+    anybody else, there is no round-robin turn-taking.
+    """
+    print("[AI WATCHER] Online. Waiting for camera buffers to fill...")
+    inference_sleep = INFERENCE_STRIDE / CAMERA_TARGET_FPS
 
     while True:
-        inference_frames, evidence_frames, current_frame_count = cam.get_snapshot()
+        ready_ids: list[str] = []
+        ready_tensors: list[torch.Tensor] = []
+        ready_scene: list[dict] = []
 
-        # Camera restart resets frame_count to 0 — reset stride tracker too,
-        # otherwise inference never runs again and the dashboard shows "—".
-        if current_frame_count < last_processed_frame_count:
-            last_processed_frame_count = 0
-            score_history.clear()
-            if alert_active:
-                cam.stop_recording()
-                alert_active = False
-            print("[AI WATCHER] Camera frame counter reset — restarting inference.")
+        for camera_id, slot in list(cameras.items()):
+            stream = slot["stream"]
+            inference_frames, _evidence_frames, current_frame_count = stream.get_snapshot()
 
-        new_frames_since_last = current_frame_count - last_processed_frame_count
-        buffer_ready = len(inference_frames) == CLIP_LENGTH
-        stride_reached = new_frames_since_last >= INFERENCE_STRIDE
+            # Camera restart resets frame_count to 0 — reset stride tracker too.
+            if current_frame_count < slot["last_processed_frame_count"]:
+                slot["last_processed_frame_count"] = 0
+                slot["score_history"].clear()
+                if slot["alert_active"]:
+                    stream.stop_recording()
+                    slot["alert_active"] = False
+                slot["warmup_remaining"] = 12
+                print(f"[AI WATCHER][{camera_id}] Frame counter reset — restarting inference.")
 
-        if not buffer_ready:
-            if score_history:
-                print("[AI WATCHER] Camera not ready — clearing stale score history.")
-                score_history.clear()
-                if alert_active:
-                    cam.stop_recording()
-                    add_log("Evidence recording stopped (camera not ready).", kind="recording")
-                    alert_active = False
-            await asyncio.sleep(INFERENCE_SLEEP)
-            continue
+            new_frames_since_last = current_frame_count - slot["last_processed_frame_count"]
+            buffer_ready = len(inference_frames) == CLIP_LENGTH
+            stride_reached = new_frames_since_last >= INFERENCE_STRIDE
 
-        if stride_reached:
-            last_processed_frame_count = current_frame_count
+            if not buffer_ready:
+                if slot["score_history"]:
+                    slot["score_history"].clear()
+                    if slot["alert_active"]:
+                        stream.stop_recording()
+                        add_log(f"[{camera_id}] Evidence recording stopped (camera not ready).", kind="recording")
+                        slot["alert_active"] = False
+                continue
+
+            if not stride_reached:
+                continue
+
+            slot["last_processed_frame_count"] = current_frame_count
 
             frames_array = np.stack(inference_frames)
             tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2).float()
             tensor.div_(255.0)
             tensor = normalize(tensor)
-            tensor = tensor.permute(1, 0, 2, 3)
-            inputs = tensor.unsqueeze(0).to(device)
+            tensor = tensor.permute(1, 0, 2, 3)  # (C, T, H, W)
 
-            with torch.no_grad():
-                outputs = model(inputs)
-                probabilities = F.softmax(outputs, dim=1)
-                current_prob = probabilities[0][1].item()
+            ready_ids.append(camera_id)
+            ready_tensors.append(tensor)
+            ready_scene.append(stream.get_scene_meta())
 
-            score_history.append(current_prob)
-            if len(score_history) < score_history.maxlen:
-                print(
-                    f"[WARMUP] {len(score_history)}/{score_history.maxlen} "
-                    f"predictions collected. Raw: {current_prob*100:.1f}%"
-                )
-            else:
-                avg_prob = sum(score_history) / len(score_history)
-                scene = cam.get_scene_meta()
-                suitable = scene.get("suitable_for_model", True)
-                print(
-                    f"Stats -> [Raw Spike: {current_prob*100:.1f}%] | "
-                    f"[SMOOTHED AVG: {avg_prob*100:.1f}%] | "
-                    f"[scene: {scene.get('method')} "
-                    f"subject={scene.get('subject_area_frac')} "
-                    f"suitable={suitable}]"
-                )
+        if ready_tensors:
+            batch = torch.stack(ready_tensors).to(device)  # (B, C, T, H, W)
+            probabilities = await asyncio.to_thread(_run_inference_batch, batch)
 
-                if avg_prob >= ALERT_THRESHOLD and not suitable:
-                    # High score on overview CCTV is usually unreliable at 112x112
-                    if alert_active:
-                        cam.stop_recording()
-                        add_log(
-                            "Recording stopped — scene unsuitable for model framing.",
-                            kind="recording",
-                        )
-                        alert_active = False
-                    print(
-                        "⚠️ Score high but subjects too small/far for reliable "
-                        "112x112 analysis — alert suppressed."
-                    )
-                elif avg_prob >= ALERT_THRESHOLD:
-                    if not alert_active:
-                        alert_active = True
-                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                        filename = f"{EVIDENCE_DIR}/incident_{timestamp}.mp4"
+            for i, camera_id in enumerate(ready_ids):
+                slot = cameras.get(camera_id)
+                if slot is None:
+                    continue  # camera was removed mid-cycle
+                current_prob = probabilities[i][1].item()
+                slot["score_history"].append(current_prob)
+                if slot.get("warmup_remaining", 0) > 0:
+                    slot["warmup_remaining"] -= 1
+                    print(f"[WARMUP][{camera_id}] Remaining warmup steps: {slot['warmup_remaining']}. Raw score: {current_prob*100:.1f}% (Suppressed)")
+                    continue
+                _handle_camera_score(camera_id, slot, current_prob, ready_scene[i])
 
-                        cam.start_recording(filename)
-                        add_log(
-                            f"ALERT: Physical altercation detected ({avg_prob*100:.1f}%). "
-                            f"Recording {filename}",
-                            level="alert",
-                            kind="alert",
-                        )
-
-                        global alert_log
-                        alert_log.append(
-                            {
-                                "timestamp": timestamp,
-                                "confidence": round(avg_prob * 100, 1),
-                                "evidence_file": filename,
-                                "scene": scene,
-                            }
-                        )
-
-                        if len(alert_log) > MAX_ALERTS:
-                            alert_log = alert_log[-MAX_ALERTS:]
-
-                        _save_alerts_atomic(alert_log, ALERTS_FILE)
-                else:
-                    if alert_active:
-                        cam.stop_recording()
-                        add_log("Evidence recording stopped.", kind="recording")
-                        alert_active = False
-                    print("✅ Safe.")
-
-        await asyncio.sleep(INFERENCE_SLEEP)
+        await asyncio.sleep(inference_sleep)
 
 
 # ==========================================
@@ -300,7 +396,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(ai_watcher())
     yield
     print("[SYSTEM] Shutting down SafeSpace...")
-    cam.stop()
+    for slot in cameras.values():
+        slot["stream"].stop()
 
 
 app = FastAPI(title="SafeSpace AI Backend", lifespan=lifespan)
@@ -317,11 +414,20 @@ app.add_middleware(
 )
 
 
+class CameraCreateRequest(BaseModel):
+    camera_id: str = Field(..., min_length=1, description="Unique id, e.g. 'entrance', 'hallway-2'")
+    label: str = Field("", description="Human-friendly display name")
+
+
 class CameraConnectRequest(BaseModel):
     ip: str = Field(..., min_length=1, description="Phone IP address on local Wi-Fi")
     port: int = Field(8080, ge=1, le=65535)
     path: str = Field("/video", description="Stream path, e.g. /video for IP Webcam")
     wifi_name: str = Field("", description="Operator label for the Wi-Fi network")
+
+
+class WebcamConnectRequest(BaseModel):
+    device_index: int = Field(0, ge=0, description="OpenCV device index, e.g. 0 or 1 for a second USB webcam")
 
 
 def _evidence_basename(path: str) -> str:
@@ -336,67 +442,115 @@ def _alert_with_url(alert: dict) -> dict:
     return out
 
 
-def _camera_receiving_frames() -> bool:
-    if not cam.is_active():
+def _camera_receiving_frames(slot: dict) -> bool:
+    stream = slot["stream"]
+    if not stream.is_active():
         return False
-    age = cam.get_last_frame_age_ms()
+    age = stream.get_last_frame_age_ms()
     if age is None:
         return False
     return age <= FRAME_STALE_MS
+
+
+def _camera_status_payload(camera_id: str, slot: dict) -> dict:
+    stream = slot["stream"]
+    config = slot["config"]
+    scores = list(slot["score_history"])
+    latest_raw = round(scores[-1] * 100, 1) if scores else None
+    latest_avg = round((sum(scores) / len(scores)) * 100, 1) if scores else None
+    camera_active = stream.is_active()
+    receiving = _camera_receiving_frames(slot)
+
+    return {
+        "camera_id": camera_id,
+        "label": config.get("label") or camera_id,
+        "backend_online": True,
+        "camera_active": camera_active,
+        "camera_receiving": receiving,
+        "camera_kind": (
+            "phone" if config.get("stream_url") else ("webcam" if camera_active or receiving else "none")
+        ),
+        "last_frame_age_ms": stream.get_last_frame_age_ms(),
+        "target_fps": stream.target_fps,
+        "actual_fps": stream.get_actual_fps(),
+        "stream_url": config.get("stream_url"),
+        "capture_url": config.get("capture_url"),
+        "via_bridge": bool(config.get("via_bridge")),
+        "wifi_name": config.get("wifi_name") or "",
+        "ip": config.get("ip") or "",
+        "port": config.get("port", 8080),
+        "path": config.get("path", "/video"),
+        "buffer_fill": f"{len(stream.get_buffer())}/{CLIP_LENGTH}",
+        "total_frames": stream.get_frame_count(),
+        "latest_raw_pct": latest_raw,
+        "smoothed_avg_pct": latest_avg,
+        "score_warmup": f"{len(scores)}/{SCORE_HISTORY_LEN}",
+        "alert_threshold": ALERT_THRESHOLD * 100,
+        "open_error": stream.open_error,
+        "scene": stream.get_scene_meta(),
+    }
 
 
 @app.get("/")
 def read_root():
     return {
         "status": "SafeSpace Core is Active",
-        "camera_active": cam.is_active(),
-        "camera_receiving": _camera_receiving_frames(),
+        "camera_count": len(cameras),
+        "cameras_active": sum(1 for s in cameras.values() if s["stream"].is_active()),
     }
 
 
-@app.get("/status")
-def get_status():
-    scores = list(score_history)
-    latest_raw = round(scores[-1] * 100, 1) if scores else None
-    # Show running average even during warmup so the dashboard isn't blank
-    latest_avg = (
-        round((sum(scores) / len(scores)) * 100, 1) if scores else None
-    )
-    age_ms = cam.get_last_frame_age_ms()
-    camera_active = cam.is_active()
-    receiving = _camera_receiving_frames()
-
+@app.get("/cameras")
+def list_cameras():
+    """One entry per registered camera — this is what a multi-camera dashboard polls."""
     return {
-        "backend_online": True,
-        "camera_active": camera_active,
-        "camera_receiving": receiving,
-        "camera_kind": (
-            "phone"
-            if device_config.get("stream_url")
-            else ("webcam" if camera_active or receiving else "none")
-        ),
-        "last_frame_age_ms": age_ms,
-        "stream_url": device_config.get("stream_url"),
-        "capture_url": device_config.get("capture_url"),
-        "via_bridge": bool(device_config.get("via_bridge")),
-        "wifi_name": device_config.get("wifi_name") or "",
-        "ip": device_config.get("ip") or "",
-        "port": device_config.get("port", 8080),
-        "path": device_config.get("path", "/video"),
-        "buffer_fill": f"{len(cam.get_buffer())}/{CLIP_LENGTH}",
-        "total_frames": cam.get_frame_count(),
-        "latest_raw_pct": latest_raw,
-        "smoothed_avg_pct": latest_avg,
-        "score_warmup": f"{len(scores)}/{SCORE_HISTORY_LEN}",
-        "alert_threshold": ALERT_THRESHOLD * 100,
-        "open_error": cam.open_error,
-        "scene": cam.get_scene_meta(),
+        "total": len(cameras),
+        "cameras": [_camera_status_payload(cid, slot) for cid, slot in cameras.items()],
     }
 
 
-@app.post("/camera/connect")
-def camera_connect(body: CameraConnectRequest):
-    global device_config
+@app.post("/cameras")
+def create_camera(body: CameraCreateRequest):
+    camera_id = body.camera_id.strip()
+    if not re.match(r"^[\w\-]+$", camera_id):
+        raise HTTPException(status_code=400, detail="camera_id may only contain letters, numbers, - and _.")
+    with _cameras_lock:
+        if camera_id in cameras:
+            raise HTTPException(status_code=409, detail=f"camera_id '{camera_id}' already exists.")
+        cameras[camera_id] = _new_camera_slot(camera_id, label=body.label)
+    _rebalance_evidence_budgets()
+    _save_cameras_config()
+    add_log(f"[{camera_id}] Camera slot created.", kind="camera")
+    return {"ok": True, "camera_id": camera_id}
+
+
+@app.delete("/cameras/{camera_id}")
+def delete_camera(camera_id: str):
+    with _cameras_lock:
+        slot = cameras.pop(camera_id, None)
+    if slot is None:
+        raise HTTPException(status_code=404, detail=f"Unknown camera_id '{camera_id}'.")
+    slot["stream"].stop()
+    _rebalance_evidence_budgets()
+    _save_cameras_config()
+    add_log(f"[{camera_id}] Camera removed.", kind="camera")
+    return {"ok": True}
+
+
+@app.get("/cameras/{camera_id}/status")
+def camera_status(camera_id: str):
+    slot = get_camera_or_404(camera_id)
+    return _camera_status_payload(camera_id, slot)
+
+
+@app.post("/cameras/{camera_id}/connect")
+def camera_connect(camera_id: str, body: CameraConnectRequest):
+    with _cameras_lock:
+        slot = cameras.get(camera_id)
+        if slot is None:
+            slot = _new_camera_slot(camera_id)
+            cameras[camera_id] = slot
+            _rebalance_evidence_budgets()
 
     ip = body.ip.strip()
     if not re.match(r"^[\w.\-]+$", ip):
@@ -404,35 +558,35 @@ def camera_connect(body: CameraConnectRequest):
 
     stream_url = build_stream_url(ip, body.port, body.path)
     add_log(
-        f"Connecting to camera at {stream_url}"
+        f"[{camera_id}] Connecting to camera at {stream_url}"
         + (f" (Wi-Fi: {body.wifi_name})" if body.wifi_name.strip() else ""),
         kind="camera",
     )
 
-    # Prefer direct phone URL; if Cursor lacks Local Network access, use LAN bridge.
     capture_url = stream_url
     used_bridge = False
     diag = diagnose_http_camera(stream_url)
     if not diag["ok"]:
         add_log(
-            "Direct phone HTTP failed (common inside Cursor). Starting LAN bridge via Terminal.app...",
+            f"[{camera_id}] Direct phone HTTP failed. Starting LAN bridge via Terminal.app...",
             level="warning",
             kind="camera",
         )
         try:
             capture_url, note = ensure_lan_bridge(stream_url)
             used_bridge = True
-            add_log(note, kind="camera")
+            add_log(f"[{camera_id}] {note}", kind="camera")
         except Exception as e:
-            add_log(f"LAN bridge failed: {e}", level="error", kind="camera")
-            device_config = {
+            add_log(f"[{camera_id}] LAN bridge failed: {e}", level="error", kind="camera")
+            slot["config"] = {
+                **_default_camera_config(),
                 "ip": ip,
                 "port": body.port,
                 "path": body.path if body.path.startswith("/") else f"/{body.path}",
                 "wifi_name": body.wifi_name.strip(),
-                "stream_url": None,
+                "label": slot["config"].get("label") or camera_id,
             }
-            _save_device_config(device_config)
+            _save_cameras_config()
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -442,10 +596,12 @@ def camera_connect(body: CameraConnectRequest):
                 ),
             )
 
-    success, error = cam.restart(capture_url)
-    score_history.clear()
+    success, error = slot["stream"].restart(capture_url)
+    slot["score_history"].clear()
+    slot["warmup_remaining"] = 12
 
-    device_config = {
+    slot["config"] = {
+        **_default_camera_config(),
         "ip": ip,
         "port": body.port,
         "path": body.path if body.path.startswith("/") else f"/{body.path}",
@@ -454,76 +610,76 @@ def camera_connect(body: CameraConnectRequest):
         "capture_url": capture_url if success else None,
         "via_bridge": used_bridge,
         "source": "phone",
+        "label": slot["config"].get("label") or camera_id,
     }
-    _save_device_config(device_config)
+    _save_cameras_config()
 
     if not success:
-        add_log(f"Camera connect failed: {error}", level="error", kind="camera")
+        add_log(f"[{camera_id}] Camera connect failed: {error}", level="error", kind="camera")
         raise HTTPException(
             status_code=400,
-            detail=error
-            or "Could not open camera stream. Check IP Webcam is running and both devices are on the same Wi-Fi.",
+            detail=error or "Could not open camera stream. Check IP Webcam is running and both devices are on the same Wi-Fi.",
         )
 
-    # Give the producer a moment to grab first frames
     time.sleep(0.5)
-    add_log(
-        "Camera connected successfully"
-        + (" via LAN bridge." if used_bridge else "."),
-        kind="camera",
-    )
+    add_log(f"[{camera_id}] Camera connected successfully" + (" via LAN bridge." if used_bridge else "."), kind="camera")
     return {
         "ok": True,
+        "camera_id": camera_id,
         "stream_url": stream_url,
         "capture_url": capture_url,
         "via_bridge": used_bridge,
-        "wifi_name": device_config["wifi_name"],
-        "camera_active": cam.is_active(),
-        "camera_receiving": _camera_receiving_frames(),
+        "wifi_name": slot["config"]["wifi_name"],
+        "camera_active": slot["stream"].is_active(),
+        "camera_receiving": _camera_receiving_frames(slot),
     }
 
 
-@app.post("/camera/connect-webcam")
-def camera_connect_webcam():
-    """Connect the laptop's built-in webcam (for testing without a phone)."""
-    global device_config
-    add_log("Connecting laptop webcam (src=0)...", kind="camera")
-    success, error = cam.restart(0)
-    score_history.clear()
-    device_config = {
-        "ip": "",
-        "port": 8080,
-        "path": "/video",
-        "wifi_name": "Laptop webcam",
-        "stream_url": None,
+@app.post("/cameras/{camera_id}/connect-webcam")
+def camera_connect_webcam(camera_id: str, body: WebcamConnectRequest = WebcamConnectRequest()):
+    """Connect a local USB/built-in webcam (device_index lets you attach a 2nd USB camera)."""
+    with _cameras_lock:
+        slot = cameras.get(camera_id)
+        if slot is None:
+            slot = _new_camera_slot(camera_id)
+            cameras[camera_id] = slot
+            _rebalance_evidence_budgets()
+
+    add_log(f"[{camera_id}] Connecting webcam (device_index={body.device_index})...", kind="camera")
+    success, error = slot["stream"].restart(body.device_index)
+    slot["score_history"].clear()
+    slot["warmup_remaining"] = 12
+    slot["config"] = {
+        **_default_camera_config(),
+        "wifi_name": "Local webcam",
         "source": "webcam",
+        "label": slot["config"].get("label") or camera_id,
     }
-    _save_device_config(device_config)
+    _save_cameras_config()
     if not success:
-        add_log(f"Webcam connect failed: {error}", level="error", kind="camera")
-        raise HTTPException(status_code=400, detail=error or "Could not open laptop webcam.")
+        add_log(f"[{camera_id}] Webcam connect failed: {error}", level="error", kind="camera")
+        raise HTTPException(status_code=400, detail=error or "Could not open webcam.")
+
     time.sleep(0.3)
-    add_log("Laptop webcam connected.", kind="camera")
+    add_log(f"[{camera_id}] Webcam connected.", kind="camera")
     return {
         "ok": True,
+        "camera_id": camera_id,
         "camera_kind": "webcam",
-        "camera_active": cam.is_active(),
-        "camera_receiving": _camera_receiving_frames(),
+        "camera_active": slot["stream"].is_active(),
+        "camera_receiving": _camera_receiving_frames(slot),
     }
 
 
-@app.post("/camera/disconnect")
-def camera_disconnect():
-    global device_config
-    cam.stop()
-    score_history.clear()
-    device_config = {
-        **device_config,
-        "stream_url": None,
-    }
-    _save_device_config(device_config)
-    add_log("Camera disconnected by operator.", kind="camera")
-    return {"ok": True, "camera_active": False}
+@app.post("/cameras/{camera_id}/disconnect")
+def camera_disconnect(camera_id: str):
+    slot = get_camera_or_404(camera_id)
+    slot["stream"].stop()
+    slot["score_history"].clear()
+    slot["config"] = {**slot["config"], "stream_url": None, "capture_url": None}
+    _save_cameras_config()
+    add_log(f"[{camera_id}] Camera disconnected by operator.", kind="camera")
+    return {"ok": True, "camera_id": camera_id, "camera_active": False}
 
 
 class LabelEvidenceRequest(BaseModel):
@@ -622,10 +778,7 @@ def label_evidence(filename: str, body: LabelEvidenceRequest):
     dest_dir = DATA_SAFE if label == "safe" else DATA_UNSAFE
     dest = os.path.join(dest_dir, safe_name)
     shutil.copy2(src, dest)
-    add_log(
-        f"Labeled {safe_name} as {label} → {dest}",
-        kind="review",
-    )
+    add_log(f"Labeled {safe_name} as {label} → {dest}", kind="review")
     return {
         "ok": True,
         "label": label,
@@ -635,10 +788,11 @@ def label_evidence(filename: str, body: LabelEvidenceRequest):
 
 
 @app.get("/alerts")
-def get_alerts():
-    recent = [_alert_with_url(a) for a in alert_log[-20:]]
+def get_alerts(camera_id: Optional[str] = None):
+    entries = alert_log if camera_id is None else [a for a in alert_log if a.get("camera_id") == camera_id]
+    recent = [_alert_with_url(a) for a in entries[-20:]]
     return {
-        "total_alerts": len(alert_log),
+        "total_alerts": len(entries),
         "recent": list(reversed(recent)),
     }
 
@@ -664,14 +818,8 @@ def get_evidence(filename: str):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="Evidence file not found.")
 
-    try:
-        playable = ensure_browser_compatible(path)
-    except Exception as e:
-        add_log(f"Evidence transcode error for {safe_name}: {e}", level="warning", kind="system")
-        playable = path
-
     return FileResponse(
-        playable,
+        path,
         media_type="video/mp4",
         filename=safe_name,
         headers={
@@ -681,40 +829,42 @@ def get_evidence(filename: str):
     )
 
 
-def _generate_mjpeg():
+def _generate_mjpeg(camera_id: str):
+    slot = get_camera_or_404(camera_id)
+    stream = slot["stream"]
     while True:
-        jpeg_bytes = cam.get_latest_frame_jpeg()
+        jpeg_bytes = stream.get_latest_frame_jpeg()
         if jpeg_bytes is not None:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n"
-            )
-        time.sleep(1.0 / 10)
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n")
+        time.sleep(1.0 / CAMERA_TARGET_FPS)
 
 
-@app.get("/feed")
-def video_feed():
+@app.get("/cameras/{camera_id}/feed")
+def video_feed(camera_id: str):
+    get_camera_or_404(camera_id)  # 404 early, before the generator starts streaming
     return StreamingResponse(
-        _generate_mjpeg(),
+        _generate_mjpeg(camera_id),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-@app.get("/preview")
-def preview_page():
-    scores = list(score_history)
+@app.get("/cameras/{camera_id}/preview")
+def preview_page(camera_id: str):
+    slot = get_camera_or_404(camera_id)
+    scores = list(slot["score_history"])
     latest_raw = round(scores[-1] * 100, 1) if scores else 0
     latest_avg = (
         round((sum(scores) / len(scores)) * 100, 1)
         if len(scores) == SCORE_HISTORY_LEN
         else 0
     )
+    stream = slot["stream"]
 
     html = f"""
   <!DOCTYPE html>
   <html>
   <head>
-    <title>SafeSpace Live Preview</title>
+    <title>SafeSpace Live Preview — {camera_id}</title>
     <style>
       body {{ background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 20px; }}
       h1 {{ color: #2dd4bf; }}
@@ -723,12 +873,12 @@ def preview_page():
     </style>
   </head>
   <body>
-    <h1>SafeSpace — Live Camera Preview</h1>
+    <h1>SafeSpace — Live Camera Preview ({camera_id})</h1>
     <p>Prefer the Next.js dashboard at <code>http://localhost:3000</code>.</p>
-    <img src="/feed" alt="Live Camera Feed" />
+    <img src="/cameras/{camera_id}/feed" alt="Live Camera Feed" />
     <div class="stats">
       <p>Latest Raw Score: <strong>{latest_raw}%</strong> | Smoothed Avg: <strong>{latest_avg}%</strong></p>
-      <p>Camera Active: <strong>{cam.is_active()}</strong> | Total Frames: <strong>{cam.get_frame_count()}</strong></p>
+      <p>Camera Active: <strong>{stream.is_active()}</strong> | Total Frames: <strong>{stream.get_frame_count()}</strong></p>
     </div>
   </body>
   </html>

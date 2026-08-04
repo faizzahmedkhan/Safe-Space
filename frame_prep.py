@@ -11,6 +11,7 @@ This module:
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -25,15 +26,24 @@ MIN_SUBJECT_AREA_FRAC = 0.05
 MIN_CROP_SIDE_FRAC = 0.35
 
 
-_hog = None
+# IMPORTANT: with multiple cameras, prepare_for_model() is called concurrently
+# from N different CameraStream producer threads. cv2.HOGDescriptor is not
+# guaranteed safe for concurrent detectMultiScale() calls on the same
+# instance from multiple threads. A single shared global here (as it was
+# before) is a latent race condition that only surfaces once you attach a
+# second camera. Thread-local storage gives every camera thread its own
+# HOGDescriptor, built lazily on first use, with zero locking overhead and
+# no cross-camera contention.
+_hog_local = threading.local()
 
 
 def _get_hog():
-    global _hog
-    if _hog is None:
-        _hog = cv2.HOGDescriptor()
-        _hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    return _hog
+    hog = getattr(_hog_local, "hog", None)
+    if hog is None:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _hog_local.hog = hog
+    return hog
 
 
 def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndarray:
