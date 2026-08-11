@@ -1,127 +1,142 @@
-# SafeSpace - AI Safety Monitor
+# SafeSpace - AI Safety Monitor (Windows)
 
-SafeSpace is a real-time AI safety monitor that watches a camera feed (laptop webcam or phone IP Webcam), looks for suspicious physical activity (like bullying or fights), and saves evidence clips when it thinks an incident occurred.
+SafeSpace is a real-time AI safety monitor for Windows that watches a camera feed (laptop webcam or phone IP Webcam), looks for suspicious physical activity like bullying or fights, and saves evidence clips when an incident is detected.
 
 Stack:
+
 - **Backend:** FastAPI + OpenCV + PyTorch (R3D-18)
 - **Dashboard:** Next.js operator UI at `http://localhost:3000`
 
-## Features
-- Connect a phone camera by IP (and optional Wi‑Fi label) from the dashboard
-- Live MJPEG preview and live violence scores
-- Clear dual status: laptop backend + phone camera
-- Alerts with evidence play/download, plus system logs
-- Continuous incident recording while the smoothed score stays above threshold
+## Windows Setup
 
-## Setup
+### 1. Clone the repository
 
-1. **Clone the repository:**
-   ```bash
-   git clone <repo_url>
-   cd FYP
-   ```
+```powershell
+git clone <repo_url>
+cd "Safe-Space"
+```
 
-2. **Pull the model weights (Git LFS required):**
-   ```bash
-   git lfs pull
-   ```
+### 2. Download model weights
 
-3. **Install Python dependencies:**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+If this repo uses Git LFS, run:
 
-4. **Install dashboard dependencies:**
-   ```bash
-   cd frontend
-   npm install
-   cd ..
-   ```
+```powershell
+git lfs pull
+```
 
-## Running the App (two processes)
+### 3. Create and activate the Python virtual environment
 
-### 1. Backend (FastAPI)
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
-You **can** run this from Cursor:
+If you prefer Command Prompt:
 
-```bash
-cd /Users/faizahmedkhan/Downloads/FYP
-source .venv/bin/activate
+```cmd
+.venv\Scripts\activate.bat
+```
+
+### 4. Install Python dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### 5. Install dashboard dependencies
+
+```powershell
+cd frontend
+npm install
+cd ..
+```
+
+## Running the App
+
+SafeSpace runs as two separate processes: backend and frontend.
+
+### Backend (FastAPI)
+
+From the project root in PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-macOS often blocks Cursor from Local Network access to your phone. SafeSpace handles that
-automatically: when Connect fails directly, it opens a **LAN bridge** in Terminal.app
-(`start_lan_bridge.command`) and pulls frames via `http://127.0.0.1:8765`. Keep that
-bridge Terminal window open while using the phone camera.
+If `uvicorn` is not found, ensure the virtual environment is activated and retry.
 
-Optional: System Settings → Privacy & Security → **Local Network** → enable **Cursor**
-so the bridge is not needed.
+### Dashboard (Next.js)
 
-### 2. Dashboard (Next.js)
-```bash
+Open a second terminal, then:
+
+```powershell
 cd frontend
 npm run dev
 ```
 
-Open **http://localhost:3000** for the operator dashboard.
+Open **http://localhost:3000** in your browser.
 
-Useful backend URLs:
+### Useful backend endpoints
+
 - `http://127.0.0.1:8000/status` — diagnostics JSON
 - `http://127.0.0.1:8000/alerts` — recent alerts
 - `http://127.0.0.1:8000/logs` — system logs
 - `http://127.0.0.1:8000/preview` — legacy HTML preview
 
-## Connect a phone as CCTV
+## Phone Camera (IP Webcam) Setup
 
-1. Put the **phone and laptop on the same Wi‑Fi**.
-2. Install **IP Webcam** (Android) or a similar IP camera app (iPhone).
-3. Start the server in the app and note the IP (e.g. `192.168.1.5`).
-4. **Close** any Safari/Chrome tab viewing the phone stream (one-client limit).
+1. Put the **phone and PC on the same Wi-Fi**.
+2. Install **IP Webcam** (Android) or an equivalent IP camera app on the phone.
+3. Start the stream server in the app and note the phone's IP address (for example, `192.168.1.5`).
+4. Close any browser tabs already viewing `http://PHONE_IP:8080`, since many phone camera apps only allow one client.
 5. In the SafeSpace dashboard:
-   - Enter the **IP address**
-   - Port defaults to `8080`, path defaults to `/video` (IP Webcam)
-   - Optionally enter a **Wi‑Fi name** label (for display only)
+   - Enter the phone **IP address**
+   - Use port `8080` and path `/video` for IP Webcam by default
+   - Optionally enter a **Wi-Fi name** label for display
    - Click **Connect phone**
-6. If a Terminal “LAN bridge” window opens, leave it running.
 
-### If Connect keeps failing
-1. Confirm IP Webcam shows **Start server** and the IP matches the dashboard.
-2. Close browser tabs to `http://PHONE_IP:8080`.
-3. Allow **Terminal** (and optionally **Cursor**) under Local Network privacy settings.
-4. Manually run `open start_lan_bridge.command`, then Connect again.
-5. For a quick UI test without the phone, click **Use laptop webcam**.
+If the phone connection fails, Windows firewall or phone app access can be the issue. Allow Python/PowerShell or the browser through the firewall, and try again.
 
-## Training & Fine-Tuning the AI
+### Quick test without a phone
 
-If you want to teach the AI on your own custom videos (e.g., to reduce false alarms):
+Use the laptop webcam option in the dashboard if no phone stream is available.
 
-1. **Prepare your data:**
-   - Put short `.mp4` videos of normal activities in `data/safe/`
-   - Put short `.mp4` videos of fights/incidents in `data/unsafe/`
-   *(Both classes are required — never train with only one folder.)*
+## Training & Fine-Tuning
 
-2. **Run the training script:**
-   ```bash
-   python train.py
-   ```
+To fine-tune the model using custom videos:
 
-3. The script fine-tunes and overwrites `safespace_bullying_model.pth`. Restart the backend to load the new weights.
+1. Prepare your training folders:
+   - `data/safe/` → short `.mp4` videos of normal behavior
+   - `data/unsafe/` → short `.mp4` videos of fights/incidents
+     _(Both folders are required. Do not train with only one class.)_
 
-## API overview
+2. Run the training script:
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/status` | Backend/camera status, scores, Wi‑Fi label |
-| POST | `/camera/connect` | `{ ip, port?, path?, wifi_name? }` |
-| POST | `/camera/disconnect` | Stop camera |
-| GET | `/alerts` | Recent alerts + evidence URLs |
-| GET | `/logs` | System event log |
-| GET | `/feed` | Live MJPEG stream |
-| GET | `/evidence/{filename}` | Play/download an evidence MP4 |
-| POST | `/analyze/video` | Upload a recording; get would_alert / safe verdict |
-| POST | `/analyze/evidence/{filename}` | Re-analyze a saved evidence clip |
-| POST | `/review/label-evidence/{filename}` | Copy clip to `data/safe` or `data/unsafe` for training |
+```powershell
+python train.py
+```
 
+3. Restart the backend after training to load the updated weights.
+
+## API Overview
+
+| Method | Path                                | Purpose                                                |
+| ------ | ----------------------------------- | ------------------------------------------------------ |
+| GET    | `/status`                           | Backend/camera status, scores, Wi-Fi label             |
+| POST   | `/camera/connect`                   | `{ ip, port?, path?, wifi_name? }`                     |
+| POST   | `/camera/disconnect`                | Stop camera                                            |
+| GET    | `/alerts`                           | Recent alerts + evidence URLs                          |
+| GET    | `/logs`                             | System event log                                       |
+| GET    | `/feed`                             | Live MJPEG stream                                      |
+| GET    | `/evidence/{filename}`              | Play/download an evidence MP4                          |
+| POST   | `/analyze/video`                    | Upload a recording; get would_alert / safe verdict     |
+| POST   | `/analyze/evidence/{filename}`      | Re-analyze a saved evidence clip                       |
+| POST   | `/review/label-evidence/{filename}` | Copy clip to `data/safe` or `data/unsafe` for training |
+
+## Notes for Windows Users
+
+- Use PowerShell or Command Prompt as administrator if you hit permission errors.
+- If camera access is blocked, allow Python, PowerShell, and your browser through Windows Firewall.
+- There is no built-in Windows version of `start_lan_bridge.command`; the app is intended to run directly on the local network.
+- If the phone app offers a browser preview, close that preview before connecting from the dashboard.
