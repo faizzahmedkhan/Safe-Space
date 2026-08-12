@@ -23,8 +23,24 @@ from collections import deque
 from camera import CameraStream, CLIP_LENGTH, diagnose_http_camera
 from bridge_ctl import ensure_lan_bridge
 from video_analyze import analyze_video_file
-from video_calibration import process_video, cut_clip
+from video_calibration import process_video, cut_clip, get_ffmpeg_binary
 import yt_dlp
+
+def ensure_web_mp4(src_path: str) -> str:
+    """Remuxes video file to standard ISO MP4 if it is in mpegts or non-web container format."""
+    if not src_path or not os.path.exists(src_path):
+        return src_path
+    ffmpeg_exe = get_ffmpeg_binary()
+    try:
+        res = subprocess.run([ffmpeg_exe, "-i", src_path], capture_output=True, text=True)
+        if "mpegts" in res.stderr.lower():
+            out_path = os.path.splitext(src_path)[0] + "_web.mp4"
+            subprocess.run([ffmpeg_exe, "-y", "-i", src_path, "-c", "copy", out_path], capture_output=True, check=True)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                os.replace(out_path, src_path)
+    except Exception:
+        pass
+    return src_path
 
 # --- THRESHOLDS & TIMINGS ---
 INFERENCE_STRIDE = 8
@@ -953,13 +969,20 @@ async def run_calibration(
     if youtube_url:
         # Download with yt-dlp
         add_log(f"Downloading YouTube video: {youtube_url}", kind="calibration")
+        ffmpeg_exe = get_ffmpeg_binary()
         ydl_opts = {
             'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
             'outtmpl': os.path.join(CALIBRATION_DIR, f'yt_{stamp}_%(id)s.%(ext)s'),
             'merge_output_format': 'mp4',
             'nocheckcertificate': True,
+            'remote_components': ['ejs:github'],
+            'js_runtimes': {'node': {}},
             'quiet': True,
         }
+        if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+            ydl_opts['ffmpeg_location'] = ffmpeg_exe
+        if os.path.exists("cookies.txt"):
+            ydl_opts["cookiefile"] = "cookies.txt"
         try:
             # Need to run yt-dlp in a thread to avoid blocking event loop
             def download_yt():
@@ -977,6 +1000,7 @@ async def run_calibration(
                             return os.path.join(CALIBRATION_DIR, f)
                     return target
             video_path = await asyncio.to_thread(download_yt)
+            video_path = ensure_web_mp4(video_path)
         except Exception as e:
             add_log(f"YouTube download failed: {e}", level="error", kind="calibration")
             raise HTTPException(status_code=400, detail=f"YouTube download failed: {e}")
@@ -989,6 +1013,7 @@ async def run_calibration(
         try:
             with open(video_path, "wb") as out:
                 shutil.copyfileobj(video_file.file, out)
+            video_path = ensure_web_mp4(video_path)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not save upload: {e}")
             
