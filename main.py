@@ -26,7 +26,7 @@ from video_analyze import analyze_video_file
 
 # --- THRESHOLDS & TIMINGS ---
 INFERENCE_STRIDE = 8
-ALERT_THRESHOLD = 0.75
+ALERT_THRESHOLD = 0.67
 ALERT_COOLDOWN_SECONDS = 5
 SCORE_HISTORY_LEN = 10
 MAX_ALERTS = 500
@@ -378,11 +378,11 @@ async def ai_watcher():
                 if slot is None:
                     continue  # camera was removed mid-cycle
                 current_prob = probabilities[i][1].item()
-                slot["score_history"].append(current_prob)
                 if slot.get("warmup_remaining", 0) > 0:
                     slot["warmup_remaining"] -= 1
                     print(f"[WARMUP][{camera_id}] Remaining warmup steps: {slot['warmup_remaining']}. Raw score: {current_prob*100:.1f}% (Suppressed)")
                     continue
+                slot["score_history"].append(current_prob)
                 _handle_camera_score(camera_id, slot, current_prob, ready_scene[i])
 
         await asyncio.sleep(inference_sleep)

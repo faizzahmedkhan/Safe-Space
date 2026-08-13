@@ -104,12 +104,11 @@ def analyze_video_file(
             score_history.append(raw)
 
             smoothed = None
-            # Adaptive smoothing: for offline analysis of short evidence clips,
-            # we can't wait for the full SCORE_HISTORY_LEN window (a 3-second
-            # clip only yields ~5 predictions). Start computing smoothed as
-            # soon as we have enough predictions for a meaningful average.
-            min_for_smoothed = min(3, SCORE_HISTORY_LEN)
-            if len(score_history) >= min_for_smoothed:
+            # Start smoothing from the very first prediction. Short evidence
+            # clips (3-4 s) yield only ~5-6 predictions; waiting for 3 before
+            # computing a smoothed score means the highest-scoring frames
+            # (which come first in a fight clip) are skipped entirely.
+            if len(score_history) >= 1:
                 smoothed = float(sum(score_history) / len(score_history))
                 peak_smoothed = max(peak_smoothed, smoothed)
                 # Only count alerts when framing is suitable
@@ -119,6 +118,17 @@ def analyze_video_file(
                         alert_active = True
                 else:
                     alert_active = False
+
+            # High-confidence single-frame override: if the model is very
+            # confident on a single prediction (raw >= 75%), treat it as
+            # alertable even if the smoothed average hasn't caught up yet.
+            # This mirrors live mode where such a spike would push an
+            # already-warm score_history above threshold.
+            INSTANT_ALERT_THRESHOLD = 0.75
+            if raw >= INSTANT_ALERT_THRESHOLD and meta.get("suitable_for_model"):
+                if not alert_active:
+                    would_alert = True
+                    alert_active = True
 
             peak_raw = max(peak_raw, raw)
             t_sec = round(frames_seen / fps, 2)
