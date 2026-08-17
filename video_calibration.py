@@ -71,16 +71,20 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
     return model
 
 
-def score_window(model: nn.Module, frames_rgb_112: List[np.ndarray], device: torch.device) -> float:
-    """Same tensor prep as main.py's _run_inference_batch: scale to [0,1]
-    only, no Kinetics normalize (must match training — see main.py notes)."""
-    arr = np.stack(frames_rgb_112)  # (T, H, W, C) uint8
-    tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).float()
-    tensor.div_(255.0)
-    tensor = tensor.permute(1, 0, 2, 3).unsqueeze(0).to(device)  # (1, C, T, H, W)
+def score_windows_batch(model: nn.Module, batch_frames: List[List[np.ndarray]], device: torch.device) -> List[float]:
+    tensors = []
+    for frames_rgb_112 in batch_frames:
+        arr = np.stack(frames_rgb_112)
+        tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).float()
+        tensor.div_(255.0)
+        tensor = tensor.permute(1, 0, 2, 3) # (C, T, H, W)
+        tensors.append(tensor)
+    
+    batch_tensor = torch.stack(tensors).to(device) # (B, C, T, H, W)
     with torch.no_grad():
-        probs = F.softmax(model(tensor), dim=1)
-    return probs[0][1].item()  # class 1 = violent, matches main.py
+        probs = F.softmax(model(batch_tensor), dim=1)
+    
+    return probs[:, 1].tolist()
 
 
 def process_video(
@@ -124,31 +128,13 @@ def process_video(
     since_last_infer = 0
     last_t_sec = 0.0
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    BATCH_SIZE = 8
+    pending_windows = []
+    pending_metadata = []
 
-        if frames_read % step != 0:
-            frames_read += 1
-            continue
-        frames_read += 1
-
-        detect_counter = (detect_counter + 1) % PERSON_DETECT_EVERY
-        run_hog = detect_counter == 1
-        rgb112, scene_meta, prev_gray, person_box = prepare_for_model(
-            frame, prev_gray, person_box_cache=person_box, run_person_detector=run_hog
-        )
-        frame_buffer.append(rgb112)
-        sampled_index += 1
-        since_last_infer += 1
-        last_t_sec = sampled_index / effective_fps
-
-        if len(frame_buffer) < CLIP_LENGTH or since_last_infer < INFERENCE_STRIDE:
-            continue
-        since_last_infer = 0
-
-        raw_score = score_window(model, list(frame_buffer), device)
+    def process_score(raw_score: float, t_sec: float, meta: dict):
+        nonlocal consecutive_above, active_start, active_peak, active_trigger
+        
         score_history.append(raw_score)
         avg_score = sum(score_history) / len(score_history)
 
@@ -163,28 +149,66 @@ def process_video(
 
         per_sample_log.append(
             {
-                "time_sec": round(last_t_sec, 2),
+                "time_sec": round(t_sec, 2),
                 "raw_score": round(raw_score, 4),
                 "smoothed_avg": round(avg_score, 4),
                 "triggered": triggered,
                 "trigger_reason": trigger_reason,
-                "scene_method": scene_meta.get("method"),
-                "subject_area_frac": scene_meta.get("subject_area_frac"),
-                "suitable_for_model": scene_meta.get("suitable_for_model"),
+                "scene_method": meta.get("method"),
+                "subject_area_frac": meta.get("subject_area_frac"),
+                "suitable_for_model": meta.get("suitable_for_model"),
             }
         )
 
-        if triggered and scene_meta.get("suitable_for_model", True):
+        if triggered and meta.get("suitable_for_model", True):
             if active_start is None:
-                active_start = last_t_sec
+                active_start = t_sec
                 active_trigger = trigger_reason
             active_peak = max(active_peak, raw_score)
         else:
             if active_start is not None:
-                events.append([active_start, last_t_sec, active_peak, active_trigger])
+                events.append([active_start, t_sec, active_peak, active_trigger])
                 active_start = None
                 active_peak = 0.0
                 active_trigger = None
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        if frames_read % step != 0:
+            frames_read += 1
+            continue
+        frames_read += 1
+
+        # HOG detection removed for calibration speedup
+        rgb112, scene_meta, prev_gray, person_box = prepare_for_model(
+            frame, prev_gray, person_box_cache=person_box, run_person_detector=False
+        )
+        frame_buffer.append(rgb112)
+        sampled_index += 1
+        since_last_infer += 1
+        last_t_sec = sampled_index / effective_fps
+
+        if len(frame_buffer) < CLIP_LENGTH or since_last_infer < INFERENCE_STRIDE:
+            continue
+        since_last_infer = 0
+
+        pending_windows.append(list(frame_buffer))
+        pending_metadata.append((last_t_sec, scene_meta))
+        
+        if len(pending_windows) == BATCH_SIZE:
+            raw_scores = score_windows_batch(model, pending_windows, device)
+            for score, (t_sec, meta) in zip(raw_scores, pending_metadata):
+                process_score(score, t_sec, meta)
+            pending_windows.clear()
+            pending_metadata.clear()
+
+    if pending_windows:
+        raw_scores = score_windows_batch(model, pending_windows, device)
+        for score, (t_sec, meta) in zip(raw_scores, pending_metadata):
+            process_score(score, t_sec, meta)
 
     if active_start is not None:
         events.append([active_start, last_t_sec, active_peak, active_trigger])

@@ -215,17 +215,18 @@ if os.path.exists(ALERTS_FILE):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[SYSTEM] Booting AI Core on: {device}")
 
-model = video_models.r3d_18()
-model.fc = nn.Linear(model.fc.in_features, 2)
+def init_model(path, device):
+    m = video_models.r3d_18()
+    m.fc = nn.Linear(m.fc.in_features, 2)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file '{path}' not found. Please pull weights.")
+    m.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    m = m.to(device)
+    m.eval()
+    return m
 
-model_path = "safespace_bullying_model.pth"
-if not os.path.exists(model_path):
-    raise FileNotFoundError(
-        f"Model file '{model_path}' not found. Please run 'git lfs pull' to download the weights."
-    )
-model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-model = model.to(device)
-model.eval()
+model = init_model("safespace_bullying_model.pth", device)
+model_smart_crop = init_model("safespace_bullying_model_smart_crop.pth", device)
 
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -946,13 +947,16 @@ def preview_page(camera_id: str):
     return HTMLResponse(content=html)
 
 
-CALIBRATION_DIR = "uploads/calibration"
-os.makedirs(CALIBRATION_DIR, exist_ok=True)
+CALIBRATION_INPUT_DIR = "uploads/calibration/inputs"
+CALIBRATION_OUTPUT_DIR = "uploads/calibration/outputs"
+os.makedirs(CALIBRATION_INPUT_DIR, exist_ok=True)
+os.makedirs(CALIBRATION_OUTPUT_DIR, exist_ok=True)
 
 @app.post("/calibration/run")
 async def run_calibration(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
+    model_type: str = Form("original"),
     target_fps: float = Form(CAMERA_TARGET_FPS),
     spike_threshold: float = Form(SPIKE_THRESHOLD),
     alert_threshold: float = Form(ALERT_THRESHOLD),
@@ -972,7 +976,7 @@ async def run_calibration(
         ffmpeg_exe = get_ffmpeg_binary()
         ydl_opts = {
             'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
-            'outtmpl': os.path.join(CALIBRATION_DIR, f'yt_{stamp}_%(id)s.%(ext)s'),
+            'outtmpl': os.path.join(CALIBRATION_INPUT_DIR, f'yt_{stamp}_%(id)s.%(ext)s'),
             'merge_output_format': 'mp4',
             'nocheckcertificate': True,
             'remote_components': ['ejs:github'],
@@ -995,9 +999,9 @@ async def run_calibration(
                     if os.path.exists(mp4_target):
                         return mp4_target
                     base = os.path.basename(target).split('.')[0]
-                    for f in os.listdir(CALIBRATION_DIR):
+                    for f in os.listdir(CALIBRATION_INPUT_DIR):
                         if base in f:
-                            return os.path.join(CALIBRATION_DIR, f)
+                            return os.path.join(CALIBRATION_INPUT_DIR, f)
                     return target
             video_path = await asyncio.to_thread(download_yt)
             video_path = ensure_web_mp4(video_path)
@@ -1009,7 +1013,7 @@ async def run_calibration(
         if not re.search(r"\.(mp4|avi|mov|mkv|webm)$", name, re.I):
             raise HTTPException(status_code=400, detail="Upload an mp4/avi/mov/mkv/webm video.")
         safe = re.sub(r"[^\w.\-]", "_", name)
-        video_path = os.path.join(CALIBRATION_DIR, f"upload_{stamp}_{safe}")
+        video_path = os.path.join(CALIBRATION_INPUT_DIR, f"upload_{stamp}_{safe}")
         try:
             with open(video_path, "wb") as out:
                 shutil.copyfileobj(video_file.file, out)
@@ -1019,10 +1023,11 @@ async def run_calibration(
             
     add_log(f"Starting calibration analysis on {video_path}", kind="calibration")
     try:
+        target_model = model_smart_crop if model_type == "smart_crop" else model
         events, per_sample_log, native_fps = await asyncio.to_thread(
             process_video,
             video_path,
-            model,
+            target_model,
             device,
             target_fps=target_fps,
             spike_threshold=spike_threshold,
@@ -1038,8 +1043,8 @@ async def run_calibration(
     clips = []
     base = os.path.splitext(os.path.basename(video_path))[0]
     for i, (s, e, peak, trig) in enumerate(events, 1):
-        out_name = f"{base}_event{i:02d}_{trig}_{s:.1f}s-{e:.1f}s_peak{peak:.2f}.mp4"
-        out_path = os.path.join(CALIBRATION_DIR, out_name)
+        out_name = f"{base}_{model_type}_event{i:02d}_{trig}_{s:.1f}s-{e:.1f}s_peak{peak:.2f}.mp4"
+        out_path = os.path.join(CALIBRATION_OUTPUT_DIR, out_name)
         try:
             await asyncio.to_thread(cut_clip, video_path, out_path, s, e)
             clips.append({
@@ -1053,13 +1058,124 @@ async def run_calibration(
             add_log(f"ffmpeg failed for {s:.1f}s-{e:.1f}s: {exc}", level="error", kind="calibration")
 
     add_log(f"Calibration complete for {video_path}. {len(clips)} events.", kind="calibration")
-    return {
+    
+    res_dict = {
         "ok": True,
         "video_path": video_path,
+        "model_type": model_type,
         "native_fps": native_fps,
         "events": clips,
         "per_sample_log": per_sample_log
     }
+    
+    json_path = os.path.join(CALIBRATION_OUTPUT_DIR, f"{base}_{model_type}_run.json")
+    try:
+        with open(json_path, "w") as f:
+            json.dump(res_dict, f)
+    except Exception as exc:
+        add_log(f"Failed to save run JSON: {exc}", level="error", kind="calibration")
+        
+    return res_dict
+
+@app.post("/calibration/run_existing")
+async def run_existing_calibration(
+    video_path: str = Form(...),
+    model_type: str = Form("original"),
+    target_fps: float = Form(CAMERA_TARGET_FPS),
+    spike_threshold: float = Form(SPIKE_THRESHOLD),
+    alert_threshold: float = Form(ALERT_THRESHOLD),
+    history_len: int = Form(SCORE_HISTORY_LEN),
+    pad_seconds: float = Form(2.0),
+    merge_gap_seconds: float = Form(1.5),
+):
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found.")
+    
+    add_log(f"Starting re-calibration analysis on {video_path} with {model_type}", kind="calibration")
+    try:
+        target_model = model_smart_crop if model_type == "smart_crop" else model
+        events, per_sample_log, native_fps = await asyncio.to_thread(
+            process_video,
+            video_path,
+            target_model,
+            device,
+            target_fps=target_fps,
+            spike_threshold=spike_threshold,
+            alert_threshold=alert_threshold,
+            history_len=history_len,
+            pad_seconds=pad_seconds,
+            merge_gap_seconds=merge_gap_seconds
+        )
+    except Exception as e:
+        add_log(f"Calibration processing failed: {e}", level="error", kind="calibration")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        
+    clips = []
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    for i, (s, e, peak, trig) in enumerate(events, 1):
+        out_name = f"{base}_{model_type}_event{i:02d}_{trig}_{s:.1f}s-{e:.1f}s_peak{peak:.2f}.mp4"
+        out_path = os.path.join(CALIBRATION_OUTPUT_DIR, out_name)
+        try:
+            await asyncio.to_thread(cut_clip, video_path, out_path, s, e)
+            clips.append({
+                "start_sec": round(s, 2),
+                "end_sec": round(e, 2),
+                "peak_score": round(peak, 4),
+                "trigger": trig,
+                "url": f"/calibration/clip/{out_name}"
+            })
+        except Exception as exc:
+            add_log(f"ffmpeg failed for {s:.1f}s-{e:.1f}s: {exc}", level="error", kind="calibration")
+
+    res_dict = {
+        "ok": True,
+        "video_path": video_path,
+        "model_type": model_type,
+        "native_fps": native_fps,
+        "events": clips,
+        "per_sample_log": per_sample_log
+    }
+    
+    json_path = os.path.join(CALIBRATION_OUTPUT_DIR, f"{base}_{model_type}_run.json")
+    try:
+        with open(json_path, "w") as f:
+            json.dump(res_dict, f)
+    except Exception as exc:
+        add_log(f"Failed to save run JSON: {exc}", level="error", kind="calibration")
+        
+    return res_dict
+
+@app.get("/calibration/runs")
+def list_calibration_runs():
+    runs = []
+    if os.path.exists(CALIBRATION_OUTPUT_DIR):
+        for fname in os.listdir(CALIBRATION_OUTPUT_DIR):
+            if fname.endswith("_run.json"):
+                base_id = fname.replace("_run.json", "")
+                path = os.path.join(CALIBRATION_OUTPUT_DIR, fname)
+                try:
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                    runs.append({
+                        "id": base_id,
+                        "video_path": data.get("video_path", ""),
+                        "model_type": data.get("model_type", "original"),
+                        "events_count": len(data.get("events", [])),
+                        "time": os.path.getctime(path)
+                    })
+                except Exception:
+                    pass
+    runs.sort(key=lambda x: x["time"], reverse=True)
+    return {"runs": runs}
+
+@app.get("/calibration/runs/{run_id}")
+def get_calibration_run(run_id: str):
+    safe_name = os.path.basename(run_id)
+    path = os.path.join(CALIBRATION_OUTPUT_DIR, f"{safe_name}_run.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Run not found.")
+    with open(path, "r") as f:
+        return json.load(f)
 
 @app.api_route("/calibration/clip/{filename}", methods=["GET", "HEAD"])
 def get_calibration_clip(filename: str):
@@ -1067,8 +1183,14 @@ def get_calibration_clip(filename: str):
     if not safe_name or safe_name != filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid clip filename.")
     
-    path = os.path.join(CALIBRATION_DIR, safe_name)
-    if not os.path.isfile(path):
+    path_out = os.path.join(CALIBRATION_OUTPUT_DIR, safe_name)
+    path_in = os.path.join(CALIBRATION_INPUT_DIR, safe_name)
+    
+    if os.path.isfile(path_out):
+        path = path_out
+    elif os.path.isfile(path_in):
+        path = path_in
+    else:
         raise HTTPException(status_code=404, detail="Clip file not found.")
 
     return FileResponse(
