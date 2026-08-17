@@ -342,8 +342,6 @@ class CameraStream:
     self.last_frame_time = None
     self.open_error = None
     self._prev_gray = None
-    self._person_box = None
-    self._person_detect_counter = 0
     self.scene_meta = {
         "suitable_for_model": True,
         "subject_area_frac": 0.0,
@@ -460,8 +458,6 @@ class CameraStream:
       self.video_writer = None
       self._recording_path = None
       self._prev_gray = None
-      self._person_box = None
-      self._person_detect_counter = 0
       self.scene_meta = {
         "suitable_for_model": True,
         "subject_area_frac": 0.0,
@@ -526,16 +522,11 @@ class CameraStream:
           f"({self.max_evidence_mb} MB)"
         )
 
-      # Crop/zoom toward people/motion so 112x112 isn't empty hallway,
+      # Crop/zoom toward motion so 112x112 isn't empty hallway,
       # and track whether subjects are large enough for this model.
-      # HOG person detect is expensive — run every 10 frames.
-      self._person_detect_counter = (self._person_detect_counter + 1) % 10
-      run_hog = self._person_detect_counter == 1
-      frame_rgb, scene_meta, self._prev_gray, self._person_box = prepare_for_model(
+      frame_rgb, scene_meta, self._prev_gray = prepare_for_model(
         frame,
         self._prev_gray,
-        person_box_cache=self._person_box,
-        run_person_detector=run_hog,
       )
 
       with self._lock:

@@ -11,7 +11,6 @@ This module:
 
 from __future__ import annotations
 
-import threading
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -25,25 +24,6 @@ MIN_SUBJECT_AREA_FRAC = 0.05
 # (avoids blowing up pure compression noise).
 MIN_CROP_SIDE_FRAC = 0.35
 
-
-# IMPORTANT: with multiple cameras, prepare_for_model() is called concurrently
-# from N different CameraStream producer threads. cv2.HOGDescriptor is not
-# guaranteed safe for concurrent detectMultiScale() calls on the same
-# instance from multiple threads. A single shared global here (as it was
-# before) is a latent race condition that only surfaces once you attach a
-# second camera. Thread-local storage gives every camera thread its own
-# HOGDescriptor, built lazily on first use, with zero locking overhead and
-# no cross-camera contention.
-_hog_local = threading.local()
-
-
-def _get_hog():
-    hog = getattr(_hog_local, "hog", None)
-    if hog is None:
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        _hog_local.hog = hog
-    return hog
 
 
 def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndarray:
@@ -59,36 +39,6 @@ def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndar
     y0 = max(0, min(h - side, cy - side // 2))
     return frame[y0 : y0 + side, x0 : x0 + side]
 
-
-def _detect_person_box(frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """Return largest person box (x, y, w, h) or None."""
-    h, w = frame.shape[:2]
-    # HOG is slow on 1080p — run on a downscaled copy
-    scale = 400.0 / max(h, w)
-    if scale > 1.0:
-        scale = 1.0
-    small = cv2.resize(frame, (int(w * scale), int(h * scale)))
-    try:
-        boxes, weights = _get_hog().detectMultiScale(
-            small,
-            winStride=(8, 8),
-            padding=(8, 8),
-            scale=1.05,
-        )
-    except Exception:
-        return None
-    if boxes is None or len(boxes) == 0:
-        return None
-    # map back to full resolution; pick highest weight / largest
-    best_i = int(np.argmax([b[2] * b[3] for b in boxes]))
-    x, y, bw, bh = boxes[best_i]
-    inv = 1.0 / scale if scale > 1e-6 else 1.0
-    return (
-        int(x * inv),
-        int(y * inv),
-        int(bw * inv),
-        int(bh * inv),
-    )
 
 
 def _detect_motion_box(
@@ -118,33 +68,21 @@ def _detect_motion_box(
 def prepare_for_model(
     frame_bgr: np.ndarray,
     prev_gray: Optional[np.ndarray] = None,
-    person_box_cache: Optional[Tuple[int, int, int, int]] = None,
-    run_person_detector: bool = True,
-) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray, Optional[Tuple[int, int, int, int]]]:
+) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
     """
     Build a 112x112 RGB frame for the model + suitability metadata.
 
     Returns:
-      rgb_112, meta, gray_for_next_frame, person_box_cache
+      rgb_112, meta, gray_for_next_frame
     """
     h, w = frame_bgr.shape[:2]
     frame_area = float(h * w)
-
-    person = person_box_cache
-    if run_person_detector:
-        detected = _detect_person_box(frame_bgr)
-        if detected is not None:
-            person = detected
-        # if detector finds nothing, keep previous cache briefly (caller may clear)
 
     motion, gray = _detect_motion_box(frame_bgr, prev_gray)
 
     box = None
     method = "full_frame"
-    if person is not None:
-        box = person
-        method = "person_crop"
-    elif motion is not None:
+    if motion is not None:
         box = motion
         method = "motion_crop"
 
@@ -168,7 +106,6 @@ def prepare_for_model(
         method = "center_crop"
 
     suitable = subject_frac >= MIN_SUBJECT_AREA_FRAC and method in (
-        "person_crop",
         "motion_crop",
     )
 
@@ -190,4 +127,4 @@ def prepare_for_model(
             )
         ),
     }
-    return rgb, meta, gray, person if method == "person_crop" else None
+    return rgb, meta, gray
