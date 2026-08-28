@@ -112,8 +112,6 @@ def process_video(
     frame_buffer: deque = deque(maxlen=CLIP_LENGTH)
     score_history: deque = deque(maxlen=history_len)
     prev_gray = None
-    person_box = None
-    detect_counter = 0
 
     events: List[list] = []  # [start_sec, end_sec, peak_score, trigger]
     active_start: Optional[float] = None
@@ -182,10 +180,7 @@ def process_video(
             continue
         frames_read += 1
 
-        # HOG detection removed for calibration speedup
-        rgb112, scene_meta, prev_gray, person_box = prepare_for_model(
-            frame, prev_gray, person_box_cache=person_box, run_person_detector=False
-        )
+        rgb112, scene_meta, prev_gray = prepare_for_model(frame, prev_gray)
         frame_buffer.append(rgb112)
         sampled_index += 1
         since_last_infer += 1
@@ -282,7 +277,7 @@ def cut_clip(src_path: str, out_path: str, start_sec: float, end_sec: float) -> 
     duration = max(0.1, end_sec - start_sec)
     ffmpeg_exe = get_ffmpeg_binary()
     cmd = [
-        ffmpeg_exe, "-y",
+        ffmpeg_exe, "-y", "-nostdin",
         "-ss", f"{start_sec:.2f}",
         "-i", src_path,
         "-t", f"{duration:.2f}",
@@ -291,8 +286,8 @@ def cut_clip(src_path: str, out_path: str, start_sec: float, end_sec: float) -> 
         out_path,
     ]
     try:
-        subprocess.run(cmd, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
+        subprocess.run(cmd, check=True, timeout=max(30.0, duration * 5.0))
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         cut_clip_opencv(src_path, out_path, start_sec, end_sec)
 
 

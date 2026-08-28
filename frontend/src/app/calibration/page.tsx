@@ -47,9 +47,9 @@ export default function CalibrationPage() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [youtubeUrl, setYoutubeUrl] = useState("");
-  const [modelType, setModelType] = useState<"original" | "smart_crop" | "compare">("original");
-  const [clipFilter, setClipFilter] = useState<"all" | "original" | "smart_crop">("all");
-  
+  const [modelType, setModelType] = useState<"original" | "smart_crop" | "smart_crop_sec_split" | "compare">("original");
+  const [clipFilter, setClipFilter] = useState<"all" | "primary" | "secondary">("all");
+
   // Settings
   const [targetFps, setTargetFps] = useState(15);
   const [spikeThreshold, setSpikeThreshold] = useState(0.9);
@@ -66,6 +66,8 @@ export default function CalibrationPage() {
   // Playback sync
   const mainVideoRef = useRef<HTMLVideoElement | null>(null);
   const [currentSec, setCurrentSec] = useState<number | null>(null);
+
+  const formatModelName = (t?: string) => t === 'smart_crop' ? 'Smart Crop' : t === 'smart_crop_sec_split' ? 'Sec Split' : 'Original';
 
   const groupedHistory = useMemo(() => {
     return history.reduce((acc, run) => {
@@ -90,6 +92,7 @@ export default function CalibrationPage() {
     setResult(null);
     setCompareResult(null);
     setCurrentSec(null);
+    setClipFilter("all");
     try {
       const res = await fetch(`http://127.0.0.1:8000/calibration/runs/${runId}`);
       if (!res.ok) throw new Error("Failed to load run");
@@ -109,6 +112,7 @@ export default function CalibrationPage() {
 
   const handleRunExisting = async (videoPath: string, targetModel: string, currentRunId: string) => {
     setLoading(true);
+    setClipFilter("all");
     try {
       const formData = new FormData();
       formData.append("video_path", videoPath);
@@ -119,14 +123,14 @@ export default function CalibrationPage() {
       formData.append("history_len", historyLen.toString());
       formData.append("pad_seconds", padSeconds.toString());
       formData.append("merge_gap_seconds", mergeGapSeconds.toString());
-      
+
       const res = await fetch("http://127.0.0.1:8000/calibration/run_existing", { method: "POST", body: formData });
       if (!res.ok) throw new Error("Failed to re-run calibration");
       const newData = await res.json();
-      
+
       const resOrig = await fetch(`http://127.0.0.1:8000/calibration/runs/${currentRunId}`);
       const origData = await resOrig.json();
-      
+
       if (origData.model_type === "original" || !origData.model_type) {
         setResult(origData);
         setCompareResult(newData);
@@ -134,7 +138,7 @@ export default function CalibrationPage() {
         setResult(newData);
         setCompareResult(origData);
       }
-      
+
       const histRes = await fetch("http://127.0.0.1:8000/calibration/runs");
       const histData = await histRes.json();
       setHistory(histData.runs || []);
@@ -155,12 +159,13 @@ export default function CalibrationPage() {
     setResult(null);
     setCompareResult(null);
     setCurrentSec(null);
+    setClipFilter("all");
 
     try {
       const formData = new FormData();
       if (tab === "upload" && file) formData.append("video_file", file);
       else if (tab === "youtube") formData.append("youtube_url", youtubeUrl);
-      
+
       formData.append("model_type", modelType === "compare" ? "original" : modelType);
       formData.append("target_fps", targetFps.toString());
       formData.append("spike_threshold", spikeThreshold.toString());
@@ -192,13 +197,13 @@ export default function CalibrationPage() {
         secondForm.append("history_len", historyLen.toString());
         secondForm.append("pad_seconds", padSeconds.toString());
         secondForm.append("merge_gap_seconds", mergeGapSeconds.toString());
-        
+
         const res2 = await fetch("http://127.0.0.1:8000/calibration/run_existing", {
           method: "POST",
           body: secondForm
         });
         if (res2.ok) {
-           setCompareResult(await res2.json());
+          setCompareResult(await res2.json());
         }
       }
     } catch (err) {
@@ -213,21 +218,21 @@ export default function CalibrationPage() {
   const activeSample =
     currentSec !== null && result?.per_sample_log && result.per_sample_log.length > 0
       ? result.per_sample_log.reduce((prev, curr) =>
-          Math.abs(curr.time_sec - currentSec) < Math.abs(prev.time_sec - currentSec) ? curr : prev
-        )
+        Math.abs(curr.time_sec - currentSec) < Math.abs(prev.time_sec - currentSec) ? curr : prev
+      )
       : null;
 
   const activeCompareSample =
     currentSec !== null && compareResult?.per_sample_log && compareResult.per_sample_log.length > 0
       ? compareResult.per_sample_log.reduce((prev, curr) =>
-          Math.abs(curr.time_sec - currentSec) < Math.abs(prev.time_sec - currentSec) ? curr : prev
-        )
+        Math.abs(curr.time_sec - currentSec) < Math.abs(prev.time_sec - currentSec) ? curr : prev
+      )
       : null;
 
   const mergedLogs = useMemo(() => {
     if (!result) return [];
     if (!compareResult) return result.per_sample_log;
-    
+
     const map = new Map();
     result.per_sample_log.forEach(item => {
       map.set(item.time_sec, { ...item, raw_score: item.raw_score, smoothed_avg: item.smoothed_avg });
@@ -235,16 +240,16 @@ export default function CalibrationPage() {
     compareResult.per_sample_log.forEach(item => {
       if (map.has(item.time_sec)) {
         const existing = map.get(item.time_sec);
-        map.set(item.time_sec, { 
-          ...existing, 
-          raw_score_smart: item.raw_score, 
-          smoothed_avg_smart: item.smoothed_avg 
+        map.set(item.time_sec, {
+          ...existing,
+          raw_score_smart: item.raw_score,
+          smoothed_avg_smart: item.smoothed_avg
         });
       } else {
-        map.set(item.time_sec, { 
-          time_sec: item.time_sec, 
-          raw_score_smart: item.raw_score, 
-          smoothed_avg_smart: item.smoothed_avg 
+        map.set(item.time_sec, {
+          time_sec: item.time_sec,
+          raw_score_smart: item.raw_score,
+          smoothed_avg_smart: item.smoothed_avg
         });
       }
     });
@@ -268,7 +273,7 @@ export default function CalibrationPage() {
               className={`${styles.tabBtn} ${tab === "upload" ? styles.tabBtnActive : ""}`}
               onClick={() => setTab("upload")}
             >
-              <Upload size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} /> 
+              <Upload size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} />
               Upload Local Video
             </button>
             <button
@@ -276,7 +281,7 @@ export default function CalibrationPage() {
               className={`${styles.tabBtn} ${tab === "youtube" ? styles.tabBtnActive : ""}`}
               onClick={() => setTab("youtube")}
             >
-              <Video size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} /> 
+              <Video size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} />
               YouTube URL
             </button>
             <button
@@ -284,7 +289,7 @@ export default function CalibrationPage() {
               className={`${styles.tabBtn} ${tab === "history" ? styles.tabBtnActive : ""}`}
               onClick={() => setTab("history")}
             >
-              <History size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} /> 
+              <History size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} />
               Previous Runs
             </button>
           </div>
@@ -297,34 +302,37 @@ export default function CalibrationPage() {
                 Object.entries(groupedHistory).map(([videoPath, runs]) => {
                   const origRun = runs.find(r => r.model_type === "original" || !r.model_type);
                   const smartRun = runs.find(r => r.model_type === "smart_crop");
+                  const secSplitRun = runs.find(r => r.model_type === "smart_crop_sec_split");
                   const displayName = videoPath.split(/[/\\]/).pop();
-                  
+                  const refRunId = (origRun || smartRun || secSplitRun)?.id || "";
+
                   return (
                     <div key={videoPath} className={styles.historyItem} style={{ flexDirection: 'column', alignItems: 'stretch' }}>
                       <div className={styles.historyMeta} style={{ marginBottom: '1rem' }}>
                         <span className={styles.historyTitle}>{displayName}</span>
                         <span className={styles.historyDate}>{new Date(runs[0].time * 1000).toLocaleString()}</span>
                       </div>
-                      
-                      <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                        {origRun && !smartRun && (
-                          <>
-                            <button onClick={() => loadRun(origRun.id)} type="button" className={styles.jumpBtn}>View Original</button>
-                            <button onClick={() => handleRunExisting(videoPath, "smart_crop", origRun.id)} type="button" className={styles.jumpBtn}>Run Smart Crop & Compare</button>
-                          </>
-                        )}
-                        {!origRun && smartRun && (
-                          <>
-                            <button onClick={() => loadRun(smartRun.id)} type="button" className={styles.jumpBtn}>View Smart Crop</button>
-                            <button onClick={() => handleRunExisting(videoPath, "original", smartRun.id)} type="button" className={styles.jumpBtn}>Run Original & Compare</button>
-                          </>
-                        )}
-                        {origRun && smartRun && (
-                          <button onClick={() => loadRun(origRun.id, smartRun.id)} type="button" className={styles.jumpBtn} style={{ background: 'rgba(59, 130, 246, 0.1)', borderColor: 'rgba(59, 130, 246, 0.3)', color: '#60a5fa' }}>
-                            View Comparison Side-by-Side
-                          </button>
-                        )}
+
+                      <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                        <strong style={{ alignSelf: 'center', fontSize: '0.875rem', color: 'var(--muted)' }}>View:</strong>
+                        {origRun && <button onClick={() => loadRun(origRun.id)} type="button" className={styles.jumpBtn}>Original</button>}
+                        {smartRun && <button onClick={() => loadRun(smartRun.id)} type="button" className={styles.jumpBtn}>Smart Crop</button>}
+                        {secSplitRun && <button onClick={() => loadRun(secSplitRun.id)} type="button" className={styles.jumpBtn}>Sec Split</button>}
+
+                        <strong style={{ alignSelf: 'center', fontSize: '0.875rem', color: 'var(--muted)', marginLeft: '1rem' }}>Run:</strong>
+                        <button onClick={() => handleRunExisting(videoPath, "original", refRunId)} type="button" className={styles.jumpBtn}>{origRun ? "Re-run Original" : "Original"}</button>
+                        <button onClick={() => handleRunExisting(videoPath, "smart_crop", refRunId)} type="button" className={styles.jumpBtn}>{smartRun ? "Re-run Smart Crop" : "Smart Crop"}</button>
+                        <button onClick={() => handleRunExisting(videoPath, "smart_crop_sec_split", refRunId)} type="button" className={styles.jumpBtn}>{secSplitRun ? "Re-run Sec Split" : "Sec Split"}</button>
                       </div>
+
+                      {(runs.length > 1) && (
+                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                          <strong style={{ alignSelf: 'center', fontSize: '0.875rem', color: 'var(--muted)' }}>Compare:</strong>
+                          {origRun && smartRun && <button onClick={() => loadRun(origRun.id, smartRun.id)} type="button" className={styles.jumpBtn} style={{ background: 'rgba(59, 130, 246, 0.1)', borderColor: 'rgba(59, 130, 246, 0.3)', color: '#60a5fa' }}>Orig vs Smart</button>}
+                          {origRun && secSplitRun && <button onClick={() => loadRun(origRun.id, secSplitRun.id)} type="button" className={styles.jumpBtn} style={{ background: 'rgba(59, 130, 246, 0.1)', borderColor: 'rgba(59, 130, 246, 0.3)', color: '#60a5fa' }}>Orig vs SecSplit</button>}
+                          {smartRun && secSplitRun && <button onClick={() => loadRun(smartRun.id, secSplitRun.id)} type="button" className={styles.jumpBtn} style={{ background: 'rgba(59, 130, 246, 0.1)', borderColor: 'rgba(59, 130, 246, 0.3)', color: '#60a5fa' }}>Smart vs SecSplit</button>}
+                        </div>
+                      )}
                     </div>
                   );
                 })
@@ -362,7 +370,8 @@ export default function CalibrationPage() {
                 <select className={styles.input} value={modelType} onChange={e => setModelType(e.target.value as any)}>
                   <option value="original">Original Model</option>
                   <option value="smart_crop">Smart Crop Model</option>
-                  <option value="compare">Run Both & Compare</option>
+                  <option value="smart_crop_sec_split">Sec Split Model</option>
+                  <option value="compare">Run Both (Orig & Smart) & Compare</option>
                 </select>
               </label>
 
@@ -459,10 +468,10 @@ export default function CalibrationPage() {
                     onTimeUpdate={(e) => setCurrentSec(e.currentTarget.currentTime)}
                   />
                 </div>
-                
-                {/* Original Model Metrics */}
+
+                {/* Primary Model Metrics */}
                 <div className={styles.metricsPanel}>
-                  <h4 style={{ margin: 0, color: '#8b5cf6' }}>Original Model</h4>
+                  <h4 style={{ margin: 0, color: '#8b5cf6' }}>{formatModelName(result.model_type)}</h4>
                   <div className={styles.metricRow}>
                     <div className={styles.metricHeader}>
                       <span>Raw Confidence Score</span>
@@ -496,13 +505,12 @@ export default function CalibrationPage() {
                   <div className={styles.statusBox}>
                     <span>Detection Status</span>
                     <div
-                      className={`${styles.statusIndicator} ${
-                        activeSample?.triggered
+                      className={`${styles.statusIndicator} ${activeSample?.triggered
                           ? activeSample.trigger_reason === "spike"
                             ? styles.spikeActive
                             : styles.sustainedActive
                           : styles.normalActive
-                      }`}
+                        }`}
                     >
                       {activeSample?.triggered
                         ? activeSample.trigger_reason === "spike"
@@ -513,10 +521,10 @@ export default function CalibrationPage() {
                   </div>
                 </div>
 
-                {/* Smart Crop Model Metrics */}
+                {/* Secondary Model Metrics */}
                 {compareResult && (
                   <div className={styles.metricsPanel} style={{ borderColor: 'rgba(239, 68, 68, 0.3)' }}>
-                    <h4 style={{ margin: 0, color: '#ef4444' }}>Smart Crop Model</h4>
+                    <h4 style={{ margin: 0, color: '#ef4444' }}>{formatModelName(compareResult.model_type)}</h4>
                     <div className={styles.metricRow}>
                       <div className={styles.metricHeader}>
                         <span>Raw Confidence Score</span>
@@ -550,13 +558,12 @@ export default function CalibrationPage() {
                     <div className={styles.statusBox}>
                       <span>Detection Status</span>
                       <div
-                        className={`${styles.statusIndicator} ${
-                          activeCompareSample?.triggered
+                        className={`${styles.statusIndicator} ${activeCompareSample?.triggered
                             ? activeCompareSample.trigger_reason === "spike"
                               ? styles.spikeActive
                               : styles.sustainedActive
                             : styles.normalActive
-                        }`}
+                          }`}
                       >
                         {activeCompareSample?.triggered
                           ? activeCompareSample.trigger_reason === "spike"
@@ -586,33 +593,33 @@ export default function CalibrationPage() {
                   style={{ cursor: 'pointer' }}
                 >
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-                  <XAxis 
-                    dataKey="time_sec" 
-                    stroke="rgba(255,255,255,0.5)" 
+                  <XAxis
+                    dataKey="time_sec"
+                    stroke="rgba(255,255,255,0.5)"
                     tickFormatter={(val) => formatTime(Number(val))}
-                    label={{ value: 'Time (MM:SS)', position: 'bottom', fill: 'rgba(255,255,255,0.5)' }} 
+                    label={{ value: 'Time (MM:SS)', position: 'bottom', fill: 'rgba(255,255,255,0.5)' }}
                   />
-                  <YAxis 
-                    domain={[0, 1]} 
-                    stroke="rgba(255,255,255,0.5)" 
+                  <YAxis
+                    domain={[0, 1]}
+                    stroke="rgba(255,255,255,0.5)"
                     label={{ value: 'Confidence', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.5)' }}
                   />
-                  <Tooltip 
+                  <Tooltip
                     contentStyle={{ backgroundColor: 'rgba(18, 26, 43, 0.9)', borderColor: 'var(--line)', color: '#fff', borderRadius: '8px' }}
                     labelFormatter={(val) => `Time: ${formatTime(Number(val))} (${Number(val).toFixed(1)}s)`}
                   />
-                  <Legend verticalAlign="top" height={36}/>
+                  <Legend verticalAlign="top" height={36} />
                   <ReferenceLine y={spikeThreshold} label="Spike Threshold" stroke="#ef4444" strokeDasharray="3 3" />
                   <ReferenceLine y={alertThreshold} label="Alert Threshold" stroke="#f59e0b" strokeDasharray="3 3" />
                   {currentSec !== null && (
                     <ReferenceLine x={currentSec} stroke="#3b82f6" strokeWidth={2} label={{ value: 'Playback', fill: '#3b82f6', position: 'top' }} />
                   )}
-                  <Line type="monotone" dataKey="raw_score" name="Original Raw" stroke="#8b5cf6" strokeWidth={1} dot={false} />
-                  <Line type="monotone" dataKey="smoothed_avg" name="Original Avg" stroke="#2dd4bf" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="raw_score" name={`${formatModelName(result.model_type)} Raw`} stroke="#8b5cf6" strokeWidth={1} dot={false} />
+                  <Line type="monotone" dataKey="smoothed_avg" name={`${formatModelName(result.model_type)} Avg`} stroke="#2dd4bf" strokeWidth={2} dot={false} />
                   {compareResult && (
                     <>
-                      <Line type="monotone" dataKey="raw_score_smart" name="Smart Crop Raw" stroke="#ef4444" strokeWidth={1} strokeDasharray="3 3" dot={false} />
-                      <Line type="monotone" dataKey="smoothed_avg_smart" name="Smart Crop Avg" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="raw_score_smart" name={`${formatModelName(compareResult.model_type)} Raw`} stroke="#ef4444" strokeWidth={1} strokeDasharray="3 3" dot={false} />
+                      <Line type="monotone" dataKey="smoothed_avg_smart" name={`${formatModelName(compareResult.model_type)} Avg`} stroke="#f59e0b" strokeWidth={2} dot={false} />
                     </>
                   )}
                 </LineChart>
@@ -622,30 +629,30 @@ export default function CalibrationPage() {
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
                 <h3 style={{ margin: 0, color: 'var(--fg)', fontSize: '1.25rem', fontWeight: 500 }}>
-                  Isolated Incident Clips 
-                  {compareResult 
-                    ? ` (Original: ${result.events.length}, Smart Crop: ${compareResult.events.length})` 
+                  Isolated Incident Clips
+                  {compareResult
+                    ? ` (${formatModelName(result.model_type)}: ${result.events.length}, ${formatModelName(compareResult.model_type)}: ${compareResult.events.length})`
                     : ` (${result.events.length})`
                   }
                 </h3>
                 {compareResult && (
-                  <select 
-                    className={styles.input} 
+                  <select
+                    className={styles.input}
                     style={{ width: 'auto', padding: '0.25rem 0.5rem', height: 'auto', minHeight: 'unset' }}
                     value={clipFilter}
                     onChange={(e) => setClipFilter(e.target.value as any)}
                   >
                     <option value="all">Show All Clips</option>
-                    <option value="original">Original Only</option>
-                    <option value="smart_crop">Smart Crop Only</option>
+                    <option value="primary">{formatModelName(result.model_type)} Only</option>
+                    <option value="secondary">{formatModelName(compareResult.model_type)} Only</option>
                   </select>
                 )}
               </div>
-              
+
               <div className={styles.clipsGrid}>
-                {/* Render Original Events */}
-                {(clipFilter === 'all' || clipFilter === 'original') && result.events.map((ev, i) => (
-                  <div key={`orig-${i}`} className={styles.clipCard}>
+                {/* Render Primary Events */}
+                {(clipFilter === 'all' || clipFilter === 'primary') && result.events.map((ev, i) => (
+                  <div key={`primary-${i}`} className={styles.clipCard}>
                     <div className={styles.videoContainer}>
                       <video src={getAPIUrl(ev.url)} controls preload="metadata" />
                     </div>
@@ -653,7 +660,7 @@ export default function CalibrationPage() {
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span className={styles.clipTime}>{formatTime(ev.start_sec)} - {formatTime(ev.end_sec)}</span>
                         <div style={{ display: 'flex', gap: '0.25rem' }}>
-                          {compareResult && <span className={styles.triggerBadge} style={{ background: '#8b5cf622', color: '#a78bfa' }}>Orig</span>}
+                          {compareResult && <span className={styles.triggerBadge} style={{ background: '#8b5cf622', color: '#a78bfa' }}>{formatModelName(result.model_type)}</span>}
                           <span className={`${styles.triggerBadge} ${ev.trigger === 'sustained' ? styles.sustained : ''}`}>
                             {ev.trigger}
                           </span>
@@ -666,10 +673,10 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                 ))}
-                
-                {/* Render Smart Crop Events */}
-                {compareResult && (clipFilter === 'all' || clipFilter === 'smart_crop') && compareResult.events.map((ev, i) => (
-                  <div key={`smart-${i}`} className={styles.clipCard} style={{ borderColor: 'rgba(239, 68, 68, 0.3)' }}>
+
+                {/* Render Secondary Events */}
+                {compareResult && (clipFilter === 'all' || clipFilter === 'secondary') && compareResult.events.map((ev, i) => (
+                  <div key={`secondary-${i}`} className={styles.clipCard} style={{ borderColor: 'rgba(239, 68, 68, 0.3)' }}>
                     <div className={styles.videoContainer}>
                       <video src={getAPIUrl(ev.url)} controls preload="metadata" />
                     </div>
@@ -677,7 +684,7 @@ export default function CalibrationPage() {
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span className={styles.clipTime}>{formatTime(ev.start_sec)} - {formatTime(ev.end_sec)}</span>
                         <div style={{ display: 'flex', gap: '0.25rem' }}>
-                          <span className={styles.triggerBadge} style={{ background: '#ef444422', color: '#f87171' }}>Smart</span>
+                          <span className={styles.triggerBadge} style={{ background: '#ef444422', color: '#f87171' }}>{formatModelName(compareResult.model_type)}</span>
                           <span className={`${styles.triggerBadge} ${ev.trigger === 'sustained' ? styles.sustained : ''}`}>
                             {ev.trigger}
                           </span>
@@ -690,7 +697,7 @@ export default function CalibrationPage() {
                     </div>
                   </div>
                 ))}
-                
+
                 {result.events.length === 0 && (!compareResult || compareResult.events.length === 0) && (
                   <p style={{ color: 'var(--muted)' }}>No segments crossed the threshold.</p>
                 )}

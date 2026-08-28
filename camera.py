@@ -306,6 +306,96 @@ class _HttpFrameSource:
     self._close_conn()
 
 
+import subprocess
+class _FFmpegStream:
+    def __init__(self, url: str, target_fps: int):
+        self.url = url
+        self.target_fps = target_fps
+        self.process = None
+        self._opened = False
+        self._buf = b""
+
+    def open(self):
+        try:
+            from video_calibration import get_ffmpeg_binary
+            ffmpeg_exe = get_ffmpeg_binary()
+        except ImportError:
+            ffmpeg_exe = "ffmpeg"
+            
+        actual_url = self.url
+        if "youtube.com" in actual_url or "youtu.be" in actual_url:
+            try:
+                import yt_dlp
+                print(f"[PRODUCER] Resolving YouTube URL dynamically...")
+                ydl_opts = {'format': 'best[protocol^=m3u8]/best', 'quiet': True}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(actual_url, download=False)
+                    actual_url = info['url']
+            except Exception as e:
+                return False, f"yt-dlp failed: {e}"
+
+        cmd = [
+            ffmpeg_exe,
+            "-hide_banner", "-loglevel", "error",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "4xx,5xx",
+            "-i", actual_url,
+            "-r", str(self.target_fps),
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-"
+        ]
+        try:
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._opened = True
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def read(self):
+        if not self._opened or not self.process:
+            return False, None
+        
+        while True:
+            chunk = self.process.stdout.read(4096)
+            if not chunk:
+                return False, None
+            self._buf += chunk
+            
+            start = self._buf.find(b"\xff\xd8")
+            if start < 0:
+                if len(self._buf) > 256000:
+                    self._buf = self._buf[-64000:]
+                continue
+            
+            end = self._buf.find(b"\xff\xd9", start + 2)
+            if end < 0:
+                if len(self._buf) > 2000000:
+                    self._buf = self._buf[start:]
+                continue
+            
+            jpg = self._buf[start : end + 2]
+            self._buf = self._buf[end + 2 :]
+            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            return True, frame
+
+    def isOpened(self):
+        return self._opened
+        
+    def release(self):
+        self._opened = False
+        if self.process:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=1)
+            except Exception:
+                pass
+            self.process = None
+            
+    def grab(self):
+        return True
+
+
 class CameraStream:
   def __init__(self, src=0, target_fps=15, show_preview=True, soft_fail=True):
     """
@@ -318,7 +408,15 @@ class CameraStream:
     self.preview_enabled = show_preview
     self.soft_fail = soft_fail
 
-    self.frame_buffer = deque(maxlen=CLIP_LENGTH)
+    # Stores (timestamp, frame_rgb) pairs, not bare frames. Deeper than
+    # CLIP_LENGTH on purpose: get_snapshot() resamples down to exactly
+    # CLIP_LENGTH frames at even 1/target_fps spacing (see _resample_window),
+    # rather than just handing over "whatever's in the deque" -- that keeps
+    # clip timing matched to what the model was trained on even when a
+    # camera's real capture rate is irregular or below target_fps. 8x
+    # headroom comfortably covers sources running well above target_fps too
+    # (storage is cheap: 112x112x3 uint8 frames are ~37KB each).
+    self.frame_buffer = deque(maxlen=CLIP_LENGTH * 8)
     self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
     self.max_evidence_mb = 150
     self.evidence_buffer_initialized = False
@@ -361,6 +459,7 @@ class CameraStream:
     if src is None:
       self.src = None
       self.is_network_stream = False
+      self.is_raw_stream = False
       self.stream = None
       self.stopped = True
       self.open_error = None
@@ -370,9 +469,13 @@ class CameraStream:
     self.is_network_stream = _is_http_url(src) or (
       isinstance(src, str) and "://" in src
     )
+    self.is_raw_stream = isinstance(src, str) and (
+      ".m3u8" in src or "manifest" in src or "googlevideo.com" in src or 
+      "youtube.com" in src or "youtu.be" in src
+    )
     self.open_error = None
 
-    if _is_http_url(src):
+    if _is_http_url(src) and not self.is_raw_stream:
       diag = diagnose_http_camera(src)
       if not diag["ok"]:
         self.stream = None
@@ -399,6 +502,22 @@ class CameraStream:
       self.stopped = False
       return True
 
+    if self.is_raw_stream:
+      ff_src = _FFmpegStream(src, target_fps=self.target_fps)
+      ok, err = ff_src.open()
+      if not ok:
+        self.stream = None
+        self.stopped = True
+        self.open_error = err or f"Failed to open FFmpeg stream for {src}"
+        print(f"[PRODUCER] {self.open_error}")
+        if not self.soft_fail:
+            raise RuntimeError(self.open_error)
+        return False
+      self.stream = ff_src
+      print(f"[PRODUCER] FFmpeg stream opened for raw HLS/YouTube via {src[:50]}...")
+      self.stopped = False
+      return True
+
     # Local webcam / RTSP via OpenCV
     stream = cv2.VideoCapture(src)
     if not stream.isOpened():
@@ -412,7 +531,7 @@ class CameraStream:
       return False
 
     self.stream = stream
-    if self.is_network_stream:
+    if self.is_network_stream and not getattr(self, 'is_raw_stream', False):
       try:
         self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
       except Exception:
@@ -488,15 +607,35 @@ class CameraStream:
 
       if use_http:
         grabbed, frame = self.stream.read()
-      elif self.is_network_stream:
+      elif self.is_network_stream and not getattr(self, 'is_raw_stream', False):
         for _ in range(5):
-          self.stream.grab()
+          try:
+            self.stream.grab()
+          except Exception:
+            pass
         grabbed, frame = self.stream.read()
       else:
         grabbed, frame = self.stream.read()
 
       if not grabbed or frame is None:
         consecutive_failures += 1
+        
+        # If a raw stream drops, reconnect quickly
+        if getattr(self, 'is_raw_stream', False) and consecutive_failures == 2:
+            print("[PRODUCER] Raw stream stalled. Fast reconnect...")
+            try:
+                self.stream.release()
+            except Exception:
+                pass
+            ff_src = _FFmpegStream(self.src, target_fps=self.target_fps)
+            ok, err = ff_src.open()
+            if not ok:
+                print(f"[PRODUCER] Fast reconnect failed: {err}")
+                time.sleep(2)
+            self.stream = ff_src
+            consecutive_failures = 0
+            continue
+
         wait_time = min(2 ** (consecutive_failures - 1), 30)
         print(
           f"[PRODUCER] Frame grab failed ({consecutive_failures}/"
@@ -530,11 +669,12 @@ class CameraStream:
       )
 
       with self._lock:
-        self.frame_buffer.append(frame_rgb)
+        now = time.time()
+        self.frame_buffer.append((now, frame_rgb))
         self.evidence_buffer.append(frame)
         self.frame_count += 1
-        self.last_frame_time = time.time()
-        self._loop_timestamps.append(self.last_frame_time)
+        self.last_frame_time = now
+        self._loop_timestamps.append(now)
         self.scene_meta = scene_meta
 
         if self.video_writer is not None:
@@ -560,17 +700,111 @@ class CameraStream:
       if remaining > 0:
         time.sleep(remaining)
 
+  def _resample_window(self, num_frames=None, target_interval=None):
+    """
+    Nearest-timestamp resampling: returns `num_frames` frames spaced at
+    even `target_interval` seconds apart, ending at the most recently
+    captured frame -- regardless of whether the camera's actual capture
+    rate is irregular, above, or below target_fps.
+
+    Why this exists: the old design just handed over "whatever's in a
+    fixed-size deque," so a camera sustaining less than target_fps
+    silently produced windows spanning MORE real time than the model was
+    trained on (CLIP_LENGTH/target_fps seconds) -- every frame-to-frame
+    step then represented more real motion than the model's spatiotemporal
+    kernels were calibrated for. This resamples by wall-clock time instead
+    of by raw arrival order, so timing stays matched to training even when
+    the source can't sustain target_fps. It degrades honestly: if the
+    source truly lacks a frame close to some target timestamp, the nearest
+    available one gets reused for that slot -- which is a smaller, more
+    predictable distribution shift (a static/duplicate frame) than
+    "everything happened twice as fast as training assumed."
+
+    Returns (frames, temporal_quality). `frames` is [] if there isn't yet
+    enough real history to responsibly fill the window (same spirit as
+    the old cold-start gate, just measured by real elapsed time covered
+    rather than raw frame count, which is harder to fool with a bursty
+    source).
+    """
+    if num_frames is None:
+      num_frames = CLIP_LENGTH
+    if target_interval is None:
+      target_interval = 1.0 / self.target_fps
+
+    buffered = list(self.frame_buffer)  # [(timestamp, frame_rgb), ...] oldest -> newest
+
+    if len(buffered) < 2:
+      return [], {
+        "unique_frames_used": len(buffered),
+        "duplication_ratio": 1.0,
+        "suitable_for_model": False,
+        "note": "Not enough history yet.",
+      }
+
+    span = buffered[-1][0] - buffered[0][0]
+    ideal_span = (num_frames - 1) * target_interval
+    # Require at least half the ideal window's real time to actually be
+    # covered before treating a resampled window as trustworthy. Below
+    # that, we'd be filling most slots with duplicates of very few real
+    # frames -- better to report "not ready" (matches the old behavior of
+    # waiting for the buffer to genuinely fill) than hand the model a
+    # near-static window and let it guess.
+    if span < 0.5 * ideal_span:
+      return [], {
+        "unique_frames_used": len(buffered),
+        "duplication_ratio": 1.0,
+        "suitable_for_model": False,
+        "note": f"Only {span:.2f}s of real history covered (need ~{ideal_span:.2f}s).",
+      }
+
+    now = buffered[-1][0]
+    target_times = [now - (num_frames - 1 - i) * target_interval for i in range(num_frames)]
+
+    frames = []
+    used_indices = set()
+    j = 0  # both buffered timestamps and target_times are non-decreasing,
+           # so a single forward-walking pointer finds each nearest match in O(n) total
+    for t in target_times:
+      while j + 1 < len(buffered) and abs(buffered[j + 1][0] - t) <= abs(buffered[j][0] - t):
+        j += 1
+      frames.append(buffered[j][1])
+      used_indices.add(j)
+
+    unique_used = len(used_indices)
+    duplication_ratio = round(1.0 - (unique_used / num_frames), 3)
+    temporal_quality = {
+      "unique_frames_used": unique_used,
+      "duplication_ratio": duplication_ratio,
+      # More than half the window had to reuse a frame because nothing
+      # closer in time existed -- the camera's real capture rate is too
+      # far below target for this window to faithfully represent
+      # training-matched timing. Mirrors frame_prep's spatial
+      # suitable_for_model check, just for the temporal axis.
+      "suitable_for_model": duplication_ratio < 0.5,
+      "note": "",
+    }
+    return frames, temporal_quality
+
   def get_buffer(self):
+    """Bare frames, most-recent CLIP_LENGTH resampled window. Used for
+    status/display purposes (e.g. buffer-fill indicators), not inference --
+    see get_snapshot() for that."""
     with self._lock:
-      return list(self.frame_buffer)
+      frames, _ = self._resample_window()
+      return frames
 
   def get_evidence_buffer(self):
     with self._lock:
       return list(self.evidence_buffer)
 
   def get_snapshot(self):
+    """Returns (inference_frames, evidence_frames, frame_count,
+    temporal_quality). inference_frames is a resampled CLIP_LENGTH window
+    at even target_fps spacing (see _resample_window) -- empty if there
+    isn't enough real history yet, same as the old fixed-deque behavior."""
     with self._lock:
-      return list(self.frame_buffer), list(self.evidence_buffer), self.frame_count
+      frames, temporal_quality = self._resample_window()
+      return frames, list(self.evidence_buffer), self.frame_count, temporal_quality
 
   def get_scene_meta(self):
     with self._lock:

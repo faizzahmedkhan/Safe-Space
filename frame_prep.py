@@ -19,7 +19,7 @@ import numpy as np
 MODEL_SIZE = 112
 # Subject bounding box must cover at least this fraction of the full frame
 # before we treat the scene as "near-field enough" for reliable alerts.
-MIN_SUBJECT_AREA_FRAC = 0.05
+MIN_SUBJECT_AREA_FRAC = 0.01
 # When zooming, never crop tighter than this fraction of the shorter side
 # (avoids blowing up pure compression noise).
 MIN_CROP_SIDE_FRAC = 0.35

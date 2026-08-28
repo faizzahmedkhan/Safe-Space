@@ -16,17 +16,10 @@ from frame_prep import prepare_for_model
 
 INFERENCE_STRIDE = 8
 SCORE_HISTORY_LEN = 10
-KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
-KINETICS_STD = [0.22803, 0.22145, 0.216989]
-
-_normalize = T.Normalize(mean=KINETICS_MEAN, std=KINETICS_STD)
-
-
 def _preprocess_clip(frames_rgb_112: List[np.ndarray], device: torch.device) -> torch.Tensor:
     frames_array = np.stack(frames_rgb_112)
     tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2).float()
     tensor.div_(255.0)
-    tensor = _normalize(tensor)
     tensor = tensor.permute(1, 0, 2, 3)
     return tensor.unsqueeze(0).to(device)
 
@@ -62,7 +55,6 @@ def analyze_video_file(
     frames_seen = 0
     since_infer = 0
     prev_gray = None
-    person_box = None
     suitable_count = 0
     unsuitable_count = 0
     last_meta: Dict[str, Any] = {}
@@ -78,12 +70,7 @@ def analyze_video_file(
             frames_seen += 1
             since_infer += 1
 
-            rgb, meta, prev_gray, person_box = prepare_for_model(
-                frame,
-                prev_gray,
-                person_box_cache=person_box,
-                run_person_detector=(frames_seen % 10 == 1),
-            )
+            rgb, meta, prev_gray = prepare_for_model(frame, prev_gray)
             last_meta = meta
             if meta.get("suitable_for_model"):
                 suitable_count += 1

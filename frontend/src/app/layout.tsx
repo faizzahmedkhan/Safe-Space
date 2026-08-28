@@ -1,22 +1,33 @@
 import type { Metadata } from "next";
-import { DM_Sans, Outfit } from "next/font/google";
+import { IBM_Plex_Sans_Condensed, IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
 import "./globals.css";
+import { SafeSpaceProvider } from "@/components/SafeSpaceProvider";
+import { Sidebar } from "@/components/Sidebar";
 
-const outfit = Outfit({
+const plexCond = IBM_Plex_Sans_Condensed({
   subsets: ["latin"],
-  variable: "--font-display",
+  weight: ["500", "600", "700"],
+  variable: "--font-cond",
   display: "swap",
 });
 
-const dmSans = DM_Sans({
+const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
-  variable: "--font-body",
+  weight: ["400", "500", "600"],
+  variable: "--font-sans",
+  display: "swap",
+});
+
+const plexMono = IBM_Plex_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500", "600"],
+  variable: "--font-mono",
   display: "swap",
 });
 
 export const metadata: Metadata = {
-  title: "SafeSpace Dashboard",
-  description: "Operator dashboard for SafeSpace violence detection",
+  title: "SafeSpace",
+  description: "School safety monitor",
 };
 
 export default function RootLayout({
@@ -26,7 +37,14 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${outfit.variable} ${dmSans.variable}`}>{children}</body>
+      <body className={`${plexCond.variable} ${plexSans.variable} ${plexMono.variable}`}>
+        <SafeSpaceProvider>
+          <div className="app">
+            <Sidebar />
+            {children}
+          </div>
+        </SafeSpaceProvider>
+      </body>
     </html>
   );
 }

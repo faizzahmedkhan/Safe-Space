@@ -26,6 +26,8 @@ export type StatusResponse = {
   ip: string;
   port: number;
   path: string;
+  source: string;
+  youtube_url?: string;
   buffer_fill: string;
   total_frames: number;
   latest_raw_pct: number | null;
@@ -53,6 +55,8 @@ export type AlertItem = {
   timestamp: string;
   confidence: number;
   evidence_file: string;
+  trigger: string;
+  review_status: "unreviewed" | "confirmed" | "dismissed";
   evidence_url?: string | null;
   camera_id?: string;
 };
@@ -142,6 +146,16 @@ export async function connectCamera(cameraId: string, payload: ConnectPayload): 
   return res.json();
 }
 
+export async function connectYouTube(cameraId: string, youtubeUrl: string): Promise<unknown> {
+  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect-youtube`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ youtube_url: youtubeUrl }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
 export async function connectWebcam(cameraId: string): Promise<unknown> {
   const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect-webcam`, {
     method: "POST",
@@ -213,6 +227,20 @@ export async function labelEvidence(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ label }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function updateAlertReview(
+  filename: string,
+  status: "confirmed" | "dismissed"
+): Promise<{ ok: boolean; review_status: string }> {
+  const name = filename.split("/").pop() || filename;
+  const res = await fetch(`${getApiUrl()}/alerts/${name}/review`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();

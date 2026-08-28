@@ -32,10 +32,10 @@ def ensure_web_mp4(src_path: str) -> str:
         return src_path
     ffmpeg_exe = get_ffmpeg_binary()
     try:
-        res = subprocess.run([ffmpeg_exe, "-i", src_path], capture_output=True, text=True)
+        res = subprocess.run([ffmpeg_exe, "-i", src_path], capture_output=True, text=True, timeout=2)
         if "mpegts" in res.stderr.lower():
             out_path = os.path.splitext(src_path)[0] + "_web.mp4"
-            subprocess.run([ffmpeg_exe, "-y", "-i", src_path, "-c", "copy", out_path], capture_output=True, check=True)
+            subprocess.run([ffmpeg_exe, "-y", "-i", src_path, "-c", "copy", out_path], capture_output=True, check=True, timeout=120)
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 os.replace(out_path, src_path)
     except Exception:
@@ -225,8 +225,9 @@ def init_model(path, device):
     m.eval()
     return m
 
-model = init_model("safespace_bullying_model.pth", device)
-model_smart_crop = init_model("safespace_bullying_model_smart_crop.pth", device)
+model = init_model("safespace_bullying_model_v2.pth", device)
+model_smart_crop = init_model("safespace_bullying_model_v2.pth", device)
+model_smart_crop_sec_split = init_model("safespace_bullying_model_v3.pth", device)
 
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -287,6 +288,7 @@ def _fire_alert(camera_id: str, slot: dict, confidence_pct: float, scene: dict, 
             "trigger": reason,
             "evidence_file": filename,
             "scene": scene,
+            "review_status": "unreviewed",
         }
     )
     if len(alert_log) > MAX_ALERTS:
@@ -391,7 +393,7 @@ async def ai_watcher():
 
         for camera_id, slot in list(cameras.items()):
             stream = slot["stream"]
-            inference_frames, _evidence_frames, current_frame_count = stream.get_snapshot()
+            inference_frames, _evidence_frames, current_frame_count, temporal_quality = stream.get_snapshot()
 
             # Camera restart resets frame_count to 0 — reset stride tracker too.
             if current_frame_count < slot["last_processed_frame_count"]:
@@ -428,7 +430,27 @@ async def ai_watcher():
 
             ready_ids.append(camera_id)
             ready_tensors.append(tensor)
-            ready_scene.append(stream.get_scene_meta())
+            spatial_meta = stream.get_scene_meta()
+            combined_scene = dict(spatial_meta)
+            combined_scene["temporal_duplication_ratio"] = temporal_quality["duplication_ratio"]
+            combined_scene["temporal_unique_frames"] = temporal_quality["unique_frames_used"]
+            # A window can only be trusted if EITHER axis being wrong
+            # wouldn't already sink it: subjects too small/far (spatial) or
+            # timing skewed by a camera that can't sustain target_fps
+            # (temporal) are independent failure modes, so suitability
+            # requires both to be OK, not just one.
+            combined_scene["suitable_for_model"] = (
+                spatial_meta.get("suitable_for_model", True) and temporal_quality["suitable_for_model"]
+            )
+            if not temporal_quality["suitable_for_model"]:
+                combined_scene["note"] = (
+                    (spatial_meta.get("note") or "")
+                    + f" | Temporal: camera sustaining below target_fps "
+                    f"({temporal_quality['unique_frames_used']}/{CLIP_LENGTH} unique frames in window, "
+                    f"{temporal_quality['duplication_ratio']*100:.0f}% duplicated) -- clip timing may not "
+                    f"match what the model was trained on."
+                ).strip(" |")
+            ready_scene.append(combined_scene)
 
         if ready_tensors:
             batch = torch.stack(ready_tensors).to(device)  # (B, C, T, H, W)
@@ -491,6 +513,10 @@ class WebcamConnectRequest(BaseModel):
     device_index: int = Field(0, ge=0, description="OpenCV device index, e.g. 0 or 1 for a second USB webcam")
 
 
+class YouTubeConnectRequest(BaseModel):
+    youtube_url: str = Field(..., min_length=1, description="The URL of the YouTube Livestream")
+
+
 def _evidence_basename(path: str) -> str:
     return os.path.basename(path)
 
@@ -500,6 +526,7 @@ def _alert_with_url(alert: dict) -> dict:
     evidence = alert.get("evidence_file") or ""
     name = _evidence_basename(evidence)
     out["evidence_url"] = f"/evidence/{name}" if name else None
+    out.setdefault("review_status", "unreviewed")
     return out
 
 
@@ -541,6 +568,12 @@ def _camera_status_payload(camera_id: str, slot: dict) -> dict:
         "ip": config.get("ip") or "",
         "port": config.get("port", 8080),
         "path": config.get("path", "/video"),
+        "source": config.get("source") or "",
+        "youtube_url": config.get("stream_url") if config.get("source") == "youtube" else "",
+        # get_buffer() now returns a resampled CLIP_LENGTH window (or [] if
+        # not enough real history yet), so this reads as "0/16" while
+        # warming up and jumps to "16/16" once ready, rather than counting
+        # up gradually frame-by-frame like the old raw-deque version did.
         "buffer_fill": f"{len(stream.get_buffer())}/{CLIP_LENGTH}",
         "total_frames": stream.get_frame_count(),
         "latest_raw_pct": latest_raw,
@@ -732,15 +765,80 @@ def camera_connect_webcam(camera_id: str, body: WebcamConnectRequest = WebcamCon
     }
 
 
+@app.post("/cameras/{camera_id}/connect-youtube")
+def camera_connect_youtube(camera_id: str, body: YouTubeConnectRequest):
+    """Connect to a YouTube Livestream using yt-dlp to extract the raw stream URL."""
+    with _cameras_lock:
+        slot = cameras.get(camera_id)
+        if slot is None:
+            slot = _new_camera_slot(camera_id)
+            cameras[camera_id] = slot
+            _rebalance_evidence_budgets()
+
+    add_log(f"[{camera_id}] Connecting to YouTube stream...", kind="camera")
+    success, error = slot["stream"].restart(body.youtube_url)
+    slot["score_history"].clear()
+    slot["warmup_remaining"] = 12
+    slot["config"] = {
+        **_default_camera_config(),
+        "wifi_name": "YouTube Livestream",
+        "source": "youtube",
+        "label": slot["config"].get("label") or camera_id,
+        "stream_url": body.youtube_url, # Storing the original youtube URL for display
+    }
+    _save_cameras_config()
+    
+    if not success:
+        add_log(f"[{camera_id}] YouTube stream connect failed: {error}", level="error", kind="camera")
+        raise HTTPException(status_code=400, detail=error or "Could not open YouTube stream.")
+
+    time.sleep(0.3)
+    add_log(f"[{camera_id}] YouTube stream connected.", kind="camera")
+    return {
+        "ok": True,
+        "camera_id": camera_id,
+        "camera_kind": "youtube",
+        "camera_active": slot["stream"].is_active(),
+        "camera_receiving": _camera_receiving_frames(slot),
+    }
+
+
+
 @app.post("/cameras/{camera_id}/disconnect")
 def camera_disconnect(camera_id: str):
     slot = get_camera_or_404(camera_id)
     slot["stream"].stop()
     slot["score_history"].clear()
-    slot["config"] = {**slot["config"], "stream_url": None, "capture_url": None}
+    # Do not wipe stream_url/capture_url so we can reconnect later
     _save_cameras_config()
     add_log(f"[{camera_id}] Camera disconnected by operator.", kind="camera")
     return {"ok": True, "camera_id": camera_id, "camera_active": False}
+
+
+class ReviewAlertRequest(BaseModel):
+    status: str = Field(..., description="'confirmed' or 'dismissed'")
+
+
+@app.patch("/alerts/{filename}/review")
+def review_alert(filename: str, body: ReviewAlertRequest):
+    """Update the operator review status (true positive / false positive) for an incident."""
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name != filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid evidence filename.")
+    
+    global alert_log
+    found = False
+    for a in alert_log:
+        if os.path.basename(a.get("evidence_file", "")) == safe_name:
+            a["review_status"] = body.status
+            found = True
+            break
+            
+    if not found:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+        
+    _save_alerts_atomic(alert_log, ALERTS_FILE)
+    return {"ok": True, "review_status": body.status}
 
 
 class LabelEvidenceRequest(BaseModel):
@@ -1023,7 +1121,12 @@ async def run_calibration(
             
     add_log(f"Starting calibration analysis on {video_path}", kind="calibration")
     try:
-        target_model = model_smart_crop if model_type == "smart_crop" else model
+        if model_type == "smart_crop":
+            target_model = model_smart_crop
+        elif model_type == "smart_crop_sec_split":
+            target_model = model_smart_crop_sec_split
+        else:
+            target_model = model
         events, per_sample_log, native_fps = await asyncio.to_thread(
             process_video,
             video_path,
@@ -1093,7 +1196,12 @@ async def run_existing_calibration(
     
     add_log(f"Starting re-calibration analysis on {video_path} with {model_type}", kind="calibration")
     try:
-        target_model = model_smart_crop if model_type == "smart_crop" else model
+        if model_type == "smart_crop":
+            target_model = model_smart_crop
+        elif model_type == "smart_crop_sec_split":
+            target_model = model_smart_crop_sec_split
+        else:
+            target_model = model
         events, per_sample_log, native_fps = await asyncio.to_thread(
             process_video,
             video_path,
