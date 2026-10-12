@@ -13,7 +13,7 @@ import re
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -23,12 +23,28 @@ from collections import deque
 from camera import CameraStream, CLIP_LENGTH, diagnose_http_camera
 from bridge_ctl import ensure_lan_bridge
 from video_analyze import analyze_video_file
+from video_calibration import process_video, cut_clip
+import yt_dlp
 
 # --- THRESHOLDS & TIMINGS ---
 INFERENCE_STRIDE = 8
 ALERT_THRESHOLD = 0.67
+# A single raw clip score at or above this fires an alert immediately,
+# bypassing the rolling average. A brief, sharp act (a slap, a sudden shove)
+# only shows up strongly in one or two ~1s clips — averaging it in with
+# SCORE_HISTORY_LEN older, calmer clips dilutes it below ALERT_THRESHOLD
+# and it never fires. This spike path exists so sudden violence isn't
+# lost to smoothing, while ALERT_THRESHOLD + the rolling average still
+# catches sustained-but-lower-confidence altercations.
+SPIKE_THRESHOLD = 0.90
 ALERT_COOLDOWN_SECONDS = 5
-SCORE_HISTORY_LEN = 10
+# Shrunk from 10 -> 4. At INFERENCE_STRIDE=8 / CAMERA_TARGET_FPS=15, 10
+# samples averaged ~6 seconds of real time — a single violent clip could
+# only move that average by 1/10th, so sustained violence for 5-6s was
+# effectively required to cross ALERT_THRESHOLD. 4 samples span ~1.6-2s,
+# which still smooths out single-frame noise/false detections without
+# burying a real short incident.
+SCORE_HISTORY_LEN = 4
 MAX_ALERTS = 500
 MAX_LOGS = 200
 FRAME_STALE_MS = 2000
@@ -39,8 +55,12 @@ CAMERA_TARGET_FPS = 15
 # with camera count (which is what a flat per-camera cap would do).
 TOTAL_EVIDENCE_BUDGET_MB = 300
 
-KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
-KINETICS_STD = [0.22803, 0.22145, 0.216989]
+# NOTE: the training notebook (SchoolBullyingDataset.__getitem__) only ever
+# does `vframes / 255.0` — it never applies Kinetics mean/std normalization.
+# The model's weights were fit to that [0,1]-scaled distribution, so we must
+# match it exactly here. Do NOT reintroduce T.Normalize(KINETICS_MEAN, ...)
+# unless you also add it to the training pipeline and retrain — otherwise
+# every live prediction is silently out-of-distribution.
 
 ALERTS_FILE = "alerts.json"
 CAMERAS_CONFIG_FILE = "cameras_config.json"
@@ -191,8 +211,6 @@ model.load_state_dict(torch.load(model_path, map_location=device, weights_only=T
 model = model.to(device)
 model.eval()
 
-normalize = T.Normalize(mean=KINETICS_MEAN, std=KINETICS_STD)
-
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(DATA_SAFE, exist_ok=True)
@@ -228,67 +246,94 @@ _rebalance_evidence_budgets()
 # ==========================================
 # 2. THE CONSUMER LOOP (Background Worker)
 # ==========================================
+def _fire_alert(camera_id: str, slot: dict, confidence_pct: float, scene: dict, reason: str) -> None:
+    """Start recording + log an alert. Shared by the spike path and the
+    sustained/averaged path so both record identically."""
+    stream = slot["stream"]
+    slot["alert_active"] = True
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{EVIDENCE_DIR}/incident_{camera_id}_{timestamp}.mp4"
+
+    stream.start_recording(filename)
+    add_log(
+        f"[{camera_id}] ALERT ({reason}): Physical altercation detected ({confidence_pct:.1f}%). Recording {filename}",
+        level="alert",
+        kind="alert",
+    )
+
+    global alert_log
+    alert_log.append(
+        {
+            "camera_id": camera_id,
+            "timestamp": timestamp,
+            "confidence": round(confidence_pct, 1),
+            "trigger": reason,
+            "evidence_file": filename,
+            "scene": scene,
+        }
+    )
+    if len(alert_log) > MAX_ALERTS:
+        alert_log = alert_log[-MAX_ALERTS:]
+    _save_alerts_atomic(alert_log, ALERTS_FILE)
+
+
 def _handle_camera_score(camera_id: str, slot: dict, current_prob: float, scene: dict) -> None:
-    """Same alert/recording state machine as before, just scoped to one camera_id."""
+    """Alert/recording state machine, scoped to one camera_id.
+
+    Two independent triggers feed the same recording path:
+      1. SPIKE path: a single raw clip score >= SPIKE_THRESHOLD fires
+         immediately. Sudden, short violence (a slap, a shove) only lights
+         up one or two ~1s clips, so it must not be forced to wait on the
+         rolling average below.
+      2. SUSTAINED path: the SCORE_HISTORY_LEN-sample rolling average
+         crossing ALERT_THRESHOLD for 2 consecutive cycles, same as before
+         — this still catches lower-confidence-but-sustained altercations
+         and filters one-off noisy frames.
+    """
     stream = slot["stream"]
     score_history = slot["score_history"]
+    suitable = scene.get("suitable_for_model", True)
 
     if len(score_history) < score_history.maxlen:
         print(f"[WARMUP][{camera_id}] {len(score_history)}/{score_history.maxlen} predictions. Raw: {current_prob*100:.1f}%")
         return
 
     avg_prob = sum(score_history) / len(score_history)
-    suitable = scene.get("suitable_for_model", True)
     print(
         f"[{camera_id}] Stats -> [Raw Spike: {current_prob*100:.1f}%] | "
         f"[SMOOTHED AVG: {avg_prob*100:.1f}%] | "
         f"[scene: {scene.get('method')} subject={scene.get('subject_area_frac')} suitable={suitable}]"
     )
 
-    if avg_prob >= ALERT_THRESHOLD and not suitable:
+    if not suitable:
         if slot["alert_active"]:
             stream.stop_recording()
             add_log(f"[{camera_id}] Recording stopped — scene unsuitable for model framing.", kind="recording")
             slot["alert_active"] = False
         slot["consecutive_above"] = 0
-        print(f"⚠️ [{camera_id}] Score high but subjects too small/far — alert suppressed.")
+        if avg_prob >= ALERT_THRESHOLD or current_prob >= SPIKE_THRESHOLD:
+            print(f"⚠️ [{camera_id}] Score high but subjects too small/far — alert suppressed.")
         return
 
+    # --- 1. Spike path: don't let smoothing eat a short, sharp incident ---
+    if current_prob >= SPIKE_THRESHOLD and not slot["alert_active"]:
+        _fire_alert(camera_id, slot, current_prob * 100, scene, reason="spike")
+        slot["consecutive_above"] = 0
+        return
+
+    # --- 2. Sustained path: rolling average over consecutive cycles ---
     if avg_prob >= ALERT_THRESHOLD:
         slot["consecutive_above"] = slot.get("consecutive_above", 0) + 1
         # Require 2 consecutive above-threshold cycles to trigger an alert.
         # This filters transient false-positive spikes (e.g. sitting with
         # minor movements that the motion crop amplifies).
         if slot["consecutive_above"] >= 2 and not slot["alert_active"]:
-            slot["alert_active"] = True
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"{EVIDENCE_DIR}/incident_{camera_id}_{timestamp}.mp4"
-
-            stream.start_recording(filename)
-            add_log(
-                f"[{camera_id}] ALERT: Physical altercation detected ({avg_prob*100:.1f}%). Recording {filename}",
-                level="alert",
-                kind="alert",
-            )
-
-            global alert_log
-            alert_log.append(
-                {
-                    "camera_id": camera_id,
-                    "timestamp": timestamp,
-                    "confidence": round(avg_prob * 100, 1),
-                    "evidence_file": filename,
-                    "scene": scene,
-                }
-            )
-            if len(alert_log) > MAX_ALERTS:
-                alert_log = alert_log[-MAX_ALERTS:]
-            _save_alerts_atomic(alert_log, ALERTS_FILE)
+            _fire_alert(camera_id, slot, avg_prob * 100, scene, reason="sustained")
         return
 
-    # Score dropped below threshold
+    # Score dropped below threshold on both paths
     slot["consecutive_above"] = 0
-    if slot["alert_active"]:
+    if slot["alert_active"] and current_prob < SPIKE_THRESHOLD:
         stream.stop_recording()
         add_log(f"[{camera_id}] Evidence recording stopped.", kind="recording")
         slot["alert_active"] = False
@@ -361,8 +406,7 @@ async def ai_watcher():
 
             frames_array = np.stack(inference_frames)
             tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2).float()
-            tensor.div_(255.0)
-            tensor = normalize(tensor)
+            tensor.div_(255.0)  # matches training: SchoolBullyingDataset only does /255.0
             tensor = tensor.permute(1, 0, 2, 3)  # (C, T, H, W)
 
             ready_ids.append(camera_id)
@@ -880,7 +924,134 @@ def preview_page(camera_id: str):
       <p>Latest Raw Score: <strong>{latest_raw}%</strong> | Smoothed Avg: <strong>{latest_avg}%</strong></p>
       <p>Camera Active: <strong>{stream.is_active()}</strong> | Total Frames: <strong>{stream.get_frame_count()}</strong></p>
     </div>
-  </body>
+    </body>
   </html>
   """
     return HTMLResponse(content=html)
+
+
+CALIBRATION_DIR = "uploads/calibration"
+os.makedirs(CALIBRATION_DIR, exist_ok=True)
+
+@app.post("/calibration/run")
+async def run_calibration(
+    video_file: Optional[UploadFile] = File(None),
+    youtube_url: Optional[str] = Form(None),
+    target_fps: float = Form(CAMERA_TARGET_FPS),
+    spike_threshold: float = Form(SPIKE_THRESHOLD),
+    alert_threshold: float = Form(ALERT_THRESHOLD),
+    history_len: int = Form(SCORE_HISTORY_LEN),
+    pad_seconds: float = Form(2.0),
+    merge_gap_seconds: float = Form(1.5),
+):
+    if not video_file and not youtube_url:
+        raise HTTPException(status_code=400, detail="Must provide video_file or youtube_url.")
+    
+    video_path = None
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if youtube_url:
+        # Download with yt-dlp
+        add_log(f"Downloading YouTube video: {youtube_url}", kind="calibration")
+        ydl_opts = {
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            'outtmpl': os.path.join(CALIBRATION_DIR, f'yt_{stamp}_%(id)s.%(ext)s'),
+            'merge_output_format': 'mp4',
+            'nocheckcertificate': True,
+            'quiet': True,
+        }
+        try:
+            # Need to run yt-dlp in a thread to avoid blocking event loop
+            def download_yt():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(youtube_url, download=True)
+                    target = ydl.prepare_filename(info)
+                    if os.path.exists(target):
+                        return target
+                    mp4_target = os.path.splitext(target)[0] + '.mp4'
+                    if os.path.exists(mp4_target):
+                        return mp4_target
+                    base = os.path.basename(target).split('.')[0]
+                    for f in os.listdir(CALIBRATION_DIR):
+                        if base in f:
+                            return os.path.join(CALIBRATION_DIR, f)
+                    return target
+            video_path = await asyncio.to_thread(download_yt)
+        except Exception as e:
+            add_log(f"YouTube download failed: {e}", level="error", kind="calibration")
+            raise HTTPException(status_code=400, detail=f"YouTube download failed: {e}")
+    else:
+        name = os.path.basename(video_file.filename or "clip.mp4")
+        if not re.search(r"\.(mp4|avi|mov|mkv|webm)$", name, re.I):
+            raise HTTPException(status_code=400, detail="Upload an mp4/avi/mov/mkv/webm video.")
+        safe = re.sub(r"[^\w.\-]", "_", name)
+        video_path = os.path.join(CALIBRATION_DIR, f"upload_{stamp}_{safe}")
+        try:
+            with open(video_path, "wb") as out:
+                shutil.copyfileobj(video_file.file, out)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not save upload: {e}")
+            
+    add_log(f"Starting calibration analysis on {video_path}", kind="calibration")
+    try:
+        events, per_sample_log, native_fps = await asyncio.to_thread(
+            process_video,
+            video_path,
+            model,
+            device,
+            target_fps=target_fps,
+            spike_threshold=spike_threshold,
+            alert_threshold=alert_threshold,
+            history_len=history_len,
+            pad_seconds=pad_seconds,
+            merge_gap_seconds=merge_gap_seconds
+        )
+    except Exception as e:
+        add_log(f"Calibration processing failed: {e}", level="error", kind="calibration")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        
+    clips = []
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    for i, (s, e, peak, trig) in enumerate(events, 1):
+        out_name = f"{base}_event{i:02d}_{trig}_{s:.1f}s-{e:.1f}s_peak{peak:.2f}.mp4"
+        out_path = os.path.join(CALIBRATION_DIR, out_name)
+        try:
+            await asyncio.to_thread(cut_clip, video_path, out_path, s, e)
+            clips.append({
+                "start_sec": round(s, 2),
+                "end_sec": round(e, 2),
+                "peak_score": round(peak, 4),
+                "trigger": trig,
+                "url": f"/calibration/clip/{out_name}"
+            })
+        except Exception as exc:
+            add_log(f"ffmpeg failed for {s:.1f}s-{e:.1f}s: {exc}", level="error", kind="calibration")
+
+    add_log(f"Calibration complete for {video_path}. {len(clips)} events.", kind="calibration")
+    return {
+        "ok": True,
+        "video_path": video_path,
+        "native_fps": native_fps,
+        "events": clips,
+        "per_sample_log": per_sample_log
+    }
+
+@app.api_route("/calibration/clip/{filename}", methods=["GET", "HEAD"])
+def get_calibration_clip(filename: str):
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name != filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid clip filename.")
+    
+    path = os.path.join(CALIBRATION_DIR, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Clip file not found.")
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=safe_name,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        },
+    )

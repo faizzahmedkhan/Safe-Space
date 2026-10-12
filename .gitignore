@@ -1,15 +1,37 @@
 evidence/
 uploads/
+calibration_out/
 *.web.mp4
 context.md
+
+# Virtual Environment & Python Cache
 .venv/
 __pycache__/
 *.pyc
-.DS_Store
-data/
+
+# Local Machine & Dynamic Runtime Configs
 alerts.json
 device_config.json
 lan_bridge_config.json
+cameras_config.json
+data/
+
+# Heavy Model Weights (>100MB exceeds GitHub push limits)
+*.pth
+*.pt
+*.onnx
+
+# Environment & IDE
+.env
+.env.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Frontend Dependencies & Builds
 frontend/node_modules/
 frontend/.next/
 frontend/.env.local
+frontend/out/
+

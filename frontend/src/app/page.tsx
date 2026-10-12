@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertItem,
@@ -232,6 +233,9 @@ export default function DashboardPage() {
       {/* Sidebar for Cameras */}
       <aside className={styles.sidebar}>
         <div className={styles.sidebarSection}>
+          <Link href="/calibration" className={styles.sidebarTitle} style={{ display: 'block', textDecoration: 'none', background: 'rgba(255,255,255,0.1)', padding: '10px', borderRadius: '8px', marginBottom: '16px', color: '#fff', textAlign: 'center' }}>
+            Open Calibration Tools
+          </Link>
           <h2 className={styles.sidebarTitle}>Cameras ({cameras.length})</h2>
           {cameras.length === 0 && (
             <p className={styles.hint}>No cameras configured yet.</p>
