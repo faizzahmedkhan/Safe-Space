@@ -1,17 +1,110 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+const API_KEY = process.env.NEXT_PUBLIC_SAFESPACE_KEY || "";
 
 export function getApiUrl(): string {
   return API_URL.replace(/\/$/, "");
 }
 
-export function feedUrl(cameraId: string): string {
-  return `${getApiUrl()}/cameras/${cameraId}/feed`;
+/** Append ?key= to media URLs (img/video cannot send headers). No-op without a key. */
+export function withKey(url: string): string {
+  if (!API_KEY) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}key=${encodeURIComponent(API_KEY)}`;
+}
+
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function isAuthError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
+}
+
+const AUTH_MSG = "API key missing or invalid (check NEXT_PUBLIC_SAFESPACE_KEY)";
+
+
+export async function readError(res: Response): Promise<string> {
+  if (res.status === 401) return AUTH_MSG;
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    return res.statusText || "Request failed";
+  }
+  try {
+    const data = JSON.parse(text);
+    if (typeof data?.detail === "string") return data.detail;
+    if (Array.isArray(data?.detail)) {
+      return data.detail
+        .map((d: { msg?: string }) => d.msg || JSON.stringify(d))
+        .join("; ");
+    }
+    return JSON.stringify(data);
+  } catch {
+    return text.trim().slice(0, 300) || res.statusText || `Request failed (${res.status})`;
+  }
+}
+
+export type ApiInit = RequestInit & { timeoutMs?: number };
+
+/** fetch wrapper: adds auth header, optional timeout, throws ApiError on !ok. */
+export async function apiFetch(path: string, init: ApiInit = {}): Promise<Response> {
+  const { timeoutMs, signal, headers, ...rest } = init;
+  const h = new Headers(headers);
+  if (API_KEY) h.set("X-SafeSpace-Key", API_KEY);
+
+  const ctrl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  if (timeoutMs) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeoutMs);
+  }
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", () => ctrl.abort(), { once: true });
+  }
+  try {
+    const res = await fetch(`${getApiUrl()}${path}`, {
+      cache: "no-store",
+      ...rest,
+      headers: h,
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new ApiError(await readError(res), res.status);
+    return res;
+  } catch (err) {
+    if (timedOut) throw new Error("Request timed out");
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const cid = encodeURIComponent;
+
+export function feedUrl(cameraId: string, bust?: number): string {
+  const u = `${getApiUrl()}/cameras/${cid(cameraId)}/feed${bust ? `?t=${bust}` : ""}`;
+  return withKey(u);
 }
 
 export function evidenceUrl(pathOrName: string): string {
   const name = pathOrName.split("/").pop() || pathOrName;
-  return `${getApiUrl()}/evidence/${name}`;
+  return withKey(`${getApiUrl()}/evidence/${cid(name)}`);
 }
+
+export type RootResponse = {
+  watcher_last_cycle_age_ms?: number | null;
+  model_version?: string | null;
+  auth_enabled?: boolean;
+  [k: string]: unknown;
+};
 
 export type StatusResponse = {
   camera_id: string;
@@ -32,6 +125,15 @@ export type StatusResponse = {
   smoothed_avg_pct: number | null;
   alert_threshold: number;
   open_error: string | null;
+  target_fps?: number;
+  score_warmup?: string;
+  framing_suitable_ratio?: number | null;
+  actual_fps?: number | null;
+  degraded?: boolean;
+  frozen?: boolean;
+  offline_since?: string | number | null;
+  coverage_pct?: number | null;
+  generation?: number;
   via_bridge?: boolean;
   capture_url?: string | null;
   scene?: {
@@ -55,6 +157,13 @@ export type AlertItem = {
   evidence_file: string;
   evidence_url?: string | null;
   camera_id?: string;
+  status?: "recording" | "processing" | "ready" | "failed";
+  trigger?: string;
+  peak?: number;
+  n_triggers?: number;
+  end_timestamp?: string;
+  model_version?: string;
+  scene?: StatusResponse["scene"];
 };
 
 export type LogItem = {
@@ -71,93 +180,69 @@ export type ConnectPayload = {
   wifi_name?: string;
 };
 
-async function readError(res: Response): Promise<string> {
-  try {
-    const data = await res.json();
-    if (typeof data.detail === "string") return data.detail;
-    if (Array.isArray(data.detail)) {
-      return data.detail
-        .map((d: { msg?: string }) => d.msg || JSON.stringify(d))
-        .join("; ");
-    }
-    return JSON.stringify(data);
-  } catch {
-    return res.statusText || "Request failed";
-  }
+export async function fetchRoot(signal?: AbortSignal, timeoutMs = 4000): Promise<RootResponse> {
+  return (await apiFetch("/", { signal, timeoutMs })).json();
 }
 
-export async function fetchCameras(): Promise<CamerasResponse> {
-  const res = await fetch(`${getApiUrl()}/cameras`, { cache: "no-store" });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+export async function fetchCameras(signal?: AbortSignal, timeoutMs = 4000): Promise<CamerasResponse> {
+  return (await apiFetch("/cameras", { signal, timeoutMs })).json();
 }
 
-export async function fetchStatus(cameraId: string): Promise<StatusResponse> {
-  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/status`, { cache: "no-store" });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+export async function fetchStatus(cameraId: string, signal?: AbortSignal): Promise<StatusResponse> {
+  return (await apiFetch(`/cameras/${cid(cameraId)}/status`, { signal })).json();
 }
 
-export async function fetchAlerts(cameraId?: string): Promise<{
-  total_alerts: number;
-  recent: AlertItem[];
-}> {
-  const url = cameraId ? `${getApiUrl()}/alerts?camera_id=${cameraId}` : `${getApiUrl()}/alerts`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+export async function fetchAlerts(
+  cameraId?: string,
+  signal?: AbortSignal,
+  timeoutMs = 4000
+): Promise<{ total_alerts: number; recent: AlertItem[] }> {
+  const q = cameraId ? `?camera_id=${cid(cameraId)}` : "";
+  return (await apiFetch(`/alerts${q}`, { signal, timeoutMs })).json();
 }
 
-export async function fetchLogs(): Promise<{ total: number; recent: LogItem[] }> {
-  const res = await fetch(`${getApiUrl()}/logs`, { cache: "no-store" });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+export async function fetchLogs(signal?: AbortSignal, timeoutMs = 4000): Promise<{ total: number; recent: LogItem[] }> {
+  return (await apiFetch("/logs", { signal, timeoutMs })).json();
 }
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
 
 export async function createCamera(cameraId: string, label: string): Promise<{ ok: boolean; camera_id: string }> {
-  const res = await fetch(`${getApiUrl()}/cameras`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ camera_id: cameraId, label }),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (
+    await apiFetch("/cameras", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ camera_id: cameraId, label }),
+    })
+  ).json();
 }
 
 export async function deleteCamera(cameraId: string): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (await apiFetch(`/cameras/${cid(cameraId)}`, { method: "DELETE" })).json();
 }
 
 export async function connectCamera(cameraId: string, payload: ConnectPayload): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (
+    await apiFetch(`/cameras/${cid(cameraId)}/connect`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(payload),
+    })
+  ).json();
 }
 
 export async function connectWebcam(cameraId: string): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/connect-webcam`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (
+    await apiFetch(`/cameras/${cid(cameraId)}/connect-webcam`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    })
+  ).json();
 }
 
 export async function disconnectCamera(cameraId: string): Promise<unknown> {
-  const res = await fetch(`${getApiUrl()}/cameras/${cameraId}/disconnect`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (await apiFetch(`/cameras/${cid(cameraId)}/disconnect`, { method: "POST" })).json();
 }
 
 export type AnalyzeResult = {
@@ -185,23 +270,12 @@ export type AnalyzeResult = {
 export async function analyzeVideoFile(file: File): Promise<AnalyzeResult> {
   const body = new FormData();
   body.append("file", file);
-  const res = await fetch(`${getApiUrl()}/analyze/video`, {
-    method: "POST",
-    body,
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (await apiFetch("/analyze/video", { method: "POST", body, timeoutMs: 300000 })).json();
 }
 
-export async function analyzeEvidence(
-  filename: string
-): Promise<AnalyzeResult> {
+export async function analyzeEvidence(filename: string): Promise<AnalyzeResult> {
   const name = filename.split("/").pop() || filename;
-  const res = await fetch(`${getApiUrl()}/analyze/evidence/${name}`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (await apiFetch(`/analyze/evidence/${cid(name)}`, { method: "POST", timeoutMs: 300000 })).json();
 }
 
 export async function labelEvidence(
@@ -209,11 +283,11 @@ export async function labelEvidence(
   label: "safe" | "unsafe"
 ): Promise<{ ok: boolean; copied_to: string; hint: string }> {
   const name = filename.split("/").pop() || filename;
-  const res = await fetch(`${getApiUrl()}/review/label-evidence/${name}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ label }),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  return (
+    await apiFetch(`/review/label-evidence/${cid(name)}`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ label }),
+    })
+  ).json();
 }
