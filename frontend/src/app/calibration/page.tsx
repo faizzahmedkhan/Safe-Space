@@ -1,8 +1,7 @@
 "use client";
 
-import { FormEvent, useState, useRef } from "react";
-import Link from "next/link";
-import { ArrowLeft, Upload, Video, PlayCircle } from "lucide-react";
+import { FormEvent, useEffect, useState, useRef } from "react";
+import { Upload, Video, PlayCircle } from "lucide-react";
 import {
   LineChart,
   Line,
@@ -14,7 +13,11 @@ import {
   ResponsiveContainer,
   ReferenceLine,
 } from "recharts";
+import { apiFetch, getApiUrl, withKey } from "@/lib/api";
+import AppBar from "@/components/AppBar";
 import styles from "./page.module.css";
+
+const CALIBRATION_TIMEOUT_MS = 30 * 60 * 1000;
 
 type CalibrationEvent = {
   start_sec: number;
@@ -29,7 +32,13 @@ type CalibrationResult = {
   video_path: string;
   native_fps: number;
   events: CalibrationEvent[];
-  per_sample_log: any[];
+  per_sample_log: Array<{
+    time_sec: number;
+    raw_score: number;
+    smoothed_avg: number;
+    triggered?: boolean;
+    trigger_reason?: string;
+  }>;
 };
 
 const formatTime = (seconds: number) => {
@@ -55,6 +64,18 @@ export default function CalibrationPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CalibrationResult | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!loading) return;
+    const start = Date.now();
+    setElapsed(0);
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [loading]);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   // Playback sync
   const mainVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -85,26 +106,28 @@ export default function CalibrationPage() {
       formData.append("pad_seconds", padSeconds.toString());
       formData.append("merge_gap_seconds", mergeGapSeconds.toString());
 
-      const res = await fetch("http://127.0.0.1:8000/calibration/run", {
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const res = await apiFetch("/calibration/run", {
         method: "POST",
         body: formData,
+        signal: ctrl.signal,
+        timeoutMs: CALIBRATION_TIMEOUT_MS,
       });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Calibration failed");
-      }
-
       const data = await res.json();
       setResult(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setError("Calibration cancelled");
+      } else {
+        setError(err instanceof Error ? err.message : "An error occurred");
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  const getAPIUrl = (path: string) => `http://127.0.0.1:8000${path}`;
+  const getAPIUrl = (path: string) => withKey(`${getApiUrl()}${path}`);
 
   const activeSample =
     currentSec !== null && result?.per_sample_log && result.per_sample_log.length > 0
@@ -114,13 +137,15 @@ export default function CalibrationPage() {
       : null;
 
   return (
-    <div className={styles.layoutContainer}>
-      <main className={styles.mainContent}>
+    <>
+      <AppBar active="calibration" />
+      <div className={`${styles.layoutContainer} gutter`}>
+      <main className={`${styles.mainContent} wrap`}>
         <div className={styles.header}>
-          <h1 className={styles.title}>Model Calibration</h1>
-          <Link href="/" className={styles.backLink}>
-            <ArrowLeft size={20} /> Back to Dashboard
-          </Link>
+          <h1 className={styles.title}>Model calibration</h1>
+          <p className={styles.lede}>
+            Run a recording through the model to tune the spike and sustained-alert thresholds.
+          </p>
         </div>
 
         <form className={styles.formCard} onSubmit={handleSubmit}>
@@ -130,7 +155,7 @@ export default function CalibrationPage() {
               className={`${styles.tabBtn} ${tab === "upload" ? styles.tabBtnActive : ""}`}
               onClick={() => setTab("upload")}
             >
-              <Upload size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} /> 
+              <Upload size={16} />
               Upload Local Video
             </button>
             <button
@@ -138,7 +163,7 @@ export default function CalibrationPage() {
               className={`${styles.tabBtn} ${tab === "youtube" ? styles.tabBtnActive : ""}`}
               onClick={() => setTab("youtube")}
             >
-              <Video size={16} style={{ display: 'inline', marginRight: 6, verticalAlign: 'text-bottom' }} /> 
+              <Video size={16} />
               YouTube URL
             </button>
           </div>
@@ -227,9 +252,9 @@ export default function CalibrationPage() {
             </div>
           </div>
 
-          {error && <div style={{ color: '#ef4444', background: 'rgba(239, 68, 68, 0.1)', padding: '1rem', borderRadius: '8px' }}>{error}</div>}
+          {error && <div className={styles.error} role="alert">{error}</div>}
 
-          <button type="submit" className={styles.submitBtn} disabled={loading || (tab === "upload" && !file) || (tab === "youtube" && !youtubeUrl)}>
+          <button type="submit" className={`btn btn-primary ${styles.submitBtn}`} disabled={loading || (tab === "upload" && !file) || (tab === "youtube" && !youtubeUrl)}>
             {loading ? "Processing Video..." : "Run Calibration"}
           </button>
         </form>
@@ -237,7 +262,12 @@ export default function CalibrationPage() {
         {loading && (
           <div className={styles.loader}>
             <div className={styles.spinner} />
-            <p>Analyzing video frames... This may take a few minutes for longer videos.</p>
+            <p>
+              Analyzing video frames... elapsed {formatTime(elapsed)}. This may take a few minutes for longer videos.
+            </p>
+            <button type="button" className="btn btn-sm" onClick={() => abortRef.current?.abort()}>
+              Cancel
+            </button>
           </div>
         )}
 
@@ -246,7 +276,7 @@ export default function CalibrationPage() {
             {/* Synchronized Uncut Video Player */}
             <div className={styles.uncutCard}>
               <div className={styles.uncutHeader}>
-                <h3>Full Uncut Video Playback & Synchronized Scores</h3>
+                <h3>Full video with synchronized scores</h3>
                 <span className={styles.timeBadge}>
                   {formatTime(currentSec || 0)}
                 </span>
@@ -304,13 +334,13 @@ export default function CalibrationPage() {
                     >
                       {activeSample?.triggered
                         ? activeSample.trigger_reason === "spike"
-                          ? "⚡ Spike Alert Triggered"
-                          : "⚠️ Sustained Alert Triggered"
-                        : "✓ Normal / Below Thresholds"}
+                          ? "Spike alert triggered"
+                          : "Sustained alert triggered"
+                        : "Normal, below thresholds"}
                     </div>
                   </div>
                   <p className={styles.seekHint}>
-                    💡 Click anywhere on the timeline chart below or an incident clip to jump the video directly to that timestamp.
+                    Click the timeline chart below, or an incident clip, to jump the video to that moment.
                   </p>
                 </div>
               </div>
@@ -318,7 +348,7 @@ export default function CalibrationPage() {
 
             {/* Confidence Score Timeline */}
             <div className={styles.chartCard}>
-              <h3>Confidence Score Timeline (Click timeline to seek video)</h3>
+              <h3>Confidence timeline</h3>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
                   data={result.per_sample_log}
@@ -332,41 +362,41 @@ export default function CalibrationPage() {
                   }}
                   style={{ cursor: 'pointer' }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e3e9f3" />
                   <XAxis 
                     dataKey="time_sec" 
-                    stroke="rgba(255,255,255,0.5)" 
+                    stroke="#5a6a82" 
                     tickFormatter={(val) => formatTime(Number(val))}
-                    label={{ value: 'Time (MM:SS)', position: 'bottom', fill: 'rgba(255,255,255,0.5)' }} 
+                    label={{ value: 'Time (MM:SS)', position: 'bottom', fill: '#5a6a82' }} 
                   />
                   <YAxis 
                     domain={[0, 1]} 
-                    stroke="rgba(255,255,255,0.5)" 
-                    label={{ value: 'Confidence', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.5)' }}
+                    stroke="#5a6a82" 
+                    label={{ value: 'Confidence', angle: -90, position: 'insideLeft', fill: '#5a6a82' }}
                   />
                   <Tooltip 
-                    contentStyle={{ backgroundColor: 'rgba(18, 26, 43, 0.9)', borderColor: 'var(--line)', color: '#fff', borderRadius: '8px' }}
+                    contentStyle={{ backgroundColor: '#ffffff', border: 'none', color: '#0e1b2e', borderRadius: 8, boxShadow: '0 6px 20px rgba(10,27,51,0.16)' }}
                     labelFormatter={(val) => `Time: ${formatTime(Number(val))} (${Number(val).toFixed(1)}s)`}
                   />
                   <Legend verticalAlign="top" height={36}/>
-                  <ReferenceLine y={spikeThreshold} label="Spike Threshold" stroke="#ef4444" strokeDasharray="3 3" />
-                  <ReferenceLine y={alertThreshold} label="Alert Threshold" stroke="#f59e0b" strokeDasharray="3 3" />
+                  <ReferenceLine y={spikeThreshold} label="Spike Threshold" stroke="#d62f3b" strokeDasharray="3 3" />
+                  <ReferenceLine y={alertThreshold} label="Alert Threshold" stroke="#b86e00" strokeDasharray="3 3" />
                   {currentSec !== null && (
-                    <ReferenceLine x={currentSec} stroke="#3b82f6" strokeWidth={2} label={{ value: 'Playback', fill: '#3b82f6', position: 'top' }} />
+                    <ReferenceLine x={currentSec} stroke="#0a1b33" strokeWidth={2} label={{ value: 'Playback', fill: '#0a1b33', position: 'top' }} />
                   )}
-                  <Line type="monotone" dataKey="raw_score" name="Raw Score" stroke="#8b5cf6" strokeWidth={1} dot={false} />
-                  <Line type="monotone" dataKey="smoothed_avg" name="Smoothed Average" stroke="#2dd4bf" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="raw_score" name="Raw Score" stroke="#7d93b8" strokeWidth={1.5} dot={false} />
+                  <Line type="monotone" dataKey="smoothed_avg" name="Smoothed Average" stroke="#1b5cf0" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
 
             {/* Isolated Clips Grid */}
             <div>
-              <h3 style={{ marginBottom: '1rem', color: 'var(--fg)', fontSize: '1.25rem', fontWeight: 500 }}>
-                Isolated Incident Clips ({result.events.length})
+              <h3 className={styles.sectionTitle} style={{ marginBottom: 16 }}>
+                Isolated incident clips ({result.events.length})
               </h3>
               {result.events.length === 0 ? (
-                <p style={{ color: 'var(--muted)' }}>No segments crossed the threshold.</p>
+                <p className={styles.lede}>No segments crossed the threshold.</p>
               ) : (
                 <div className={styles.clipsGrid}>
                   {result.events.map((ev, i) => (
@@ -383,11 +413,11 @@ export default function CalibrationPage() {
                         </div>
                         <div className={styles.clipMeta}>
                           <span>Peak Score:</span>
-                          <span style={{ color: '#fff', fontWeight: 500 }}>{(ev.peak_score * 100).toFixed(1)}%</span>
+                          <strong>{(ev.peak_score * 100).toFixed(1)}%</strong>
                         </div>
                         <button
                           type="button"
-                          className={styles.jumpBtn}
+                          className={`btn btn-sm ${styles.jumpBtn}`}
                           onClick={() => {
                             if (mainVideoRef.current) {
                               mainVideoRef.current.currentTime = ev.start_sec;
@@ -396,8 +426,8 @@ export default function CalibrationPage() {
                             }
                           }}
                         >
-                          <PlayCircle size={14} style={{ display: 'inline', marginRight: 4 }} />
-                          Seek Uncut Video to {formatTime(ev.start_sec)}
+                          <PlayCircle size={14} />
+                          Seek video to {formatTime(ev.start_sec)}
                         </button>
                       </div>
                     </div>
@@ -408,6 +438,7 @@ export default function CalibrationPage() {
           </div>
         )}
       </main>
-    </div>
+      </div>
+    </>
   );
 }

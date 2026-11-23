@@ -1,7 +1,7 @@
 "use client";
 
-import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { Play, Plus, Upload, X } from "lucide-react";
 import {
   AlertItem,
   AnalyzeResult,
@@ -15,25 +15,54 @@ import {
   disconnectCamera,
   createCamera,
   deleteCamera,
-  evidenceUrl,
-  feedUrl,
   fetchAlerts,
   fetchLogs,
-  fetchStatus,
   fetchCameras,
+  fetchRoot,
+  isAuthError,
   labelEvidence,
+  RootResponse,
 } from "@/lib/api";
+import AddCameraDialog from "@/components/AddCameraDialog";
+import AlertFeed, { type Scope, type Tab, type Verdict } from "@/components/AlertFeed";
+import AppBar from "@/components/AppBar";
+import CameraWall from "@/components/CameraWall";
+import MonitorPanel from "@/components/MonitorPanel";
+import StatBand from "@/components/StatBand";
 import styles from "./page.module.css";
 
-type Tab = "alerts" | "logs";
+const POLL_MS = 1000;
+const REQ_TIMEOUT_MS = 4000;
+const FEED_RETRY_MS = 5000;
+
+type EndpointErrors = {
+  root: string | null;
+  cameras: string | null;
+  alerts: string | null;
+  logs: string | null;
+};
+const NO_ERRORS: EndpointErrors = { root: null, cameras: null, alerts: null, logs: null };
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : "Request failed";
+}
 
 export default function DashboardPage() {
   const [cameras, setCameras] = useState<StatusResponse[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
-  const [backendOnline, setBackendOnline] = useState(false);
+  const hasLoaded = useRef(false);
+  const [errors, setErrors] = useState<EndpointErrors>(NO_ERRORS);
+  const [authFailed, setAuthFailed] = useState(false);
+  const [root, setRoot] = useState<RootResponse | null>(null);
+  const [feedLost, setFeedLost] = useState(false);
+  const [feedBust, setFeedBust] = useState(0);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [tab, setTab] = useState<Tab>("alerts");
+  const [scope, setScope] = useState<Scope>("selected");
+  const [verdicts, setVerdicts] = useState<Record<string, Verdict>>({});
+  const [addOpen, setAddOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Add camera form state
   const [newCameraId, setNewCameraId] = useState("");
@@ -52,31 +81,111 @@ export default function DashboardPage() {
   const [reviewResult, setReviewResult] = useState<AnalyzeResult | null>(null);
   const [labelMsg, setLabelMsg] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const [c, a, l] = await Promise.all([
-        fetchCameras(),
-        fetchAlerts(selectedCameraId || undefined),
-        fetchLogs(),
-      ]);
-      setCameras(c.cameras);
-      setBackendOnline(true);
-      setAlerts(a.recent);
-      setLogs(l.recent);
+  const backendOnline = errors.cameras === null && cameras.length >= 0 && !authFailed && hasLoaded.current;
 
-      if (!selectedCameraId && c.cameras.length > 0) {
-        setSelectedCameraId(c.cameras[0].camera_id);
-      }
-    } catch {
-      setBackendOnline(false);
-    }
+  const selectedRef = useRef<string | null>(null);
+  const scopeRef = useRef<Scope>("selected");
+  const reqIdRef = useRef(0);
+  const ctrlRef = useRef<AbortController | null>(null);
+  const inFlightRef = useRef(false);
+
+  useEffect(() => {
+    selectedRef.current = selectedCameraId;
   }, [selectedCameraId]);
 
   useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 1000);
-    return () => clearInterval(id);
+    scopeRef.current = scope;
+  }, [scope]);
+
+  // Runs one poll. A newer call (e.g. camera switch) aborts and supersedes an older one.
+  const refresh = useCallback(async (supersede = false) => {
+    if (inFlightRef.current && !supersede) return;
+    ctrlRef.current?.abort();
+    const ctrl = new AbortController();
+    ctrlRef.current = ctrl;
+    const reqId = ++reqIdRef.current;
+    const camAtStart = selectedRef.current;
+    const scopeAtStart = scopeRef.current;
+    inFlightRef.current = true;
+    try {
+      const [r, c, a, l] = await Promise.allSettled([
+        fetchRoot(ctrl.signal, REQ_TIMEOUT_MS),
+        fetchCameras(ctrl.signal, REQ_TIMEOUT_MS),
+        fetchAlerts(scopeAtStart === "all" ? undefined : camAtStart || undefined, ctrl.signal, REQ_TIMEOUT_MS),
+        fetchLogs(ctrl.signal, REQ_TIMEOUT_MS),
+      ]);
+      // Drop stale responses (superseded request or camera switched meanwhile).
+      if (reqId !== reqIdRef.current) return;
+      hasLoaded.current = true;
+      const next: EndpointErrors = {
+        root: r.status === "rejected" ? errMsg(r.reason) : null,
+        cameras: c.status === "rejected" ? errMsg(c.reason) : null,
+        alerts: a.status === "rejected" ? errMsg(a.reason) : null,
+        logs: l.status === "rejected" ? errMsg(l.reason) : null,
+      };
+      setErrors(next);
+      setAuthFailed([r, c, a, l].some((x) => x.status === "rejected" && isAuthError(x.reason)));
+      if (r.status === "fulfilled") setRoot(r.value);
+      if (l.status === "fulfilled") setLogs(l.value.recent);
+      if (a.status === "fulfilled" && camAtStart === selectedRef.current && scopeAtStart === scopeRef.current) {
+        setAlerts(a.value.recent);
+      }
+      if (c.status === "fulfilled") {
+        const list = c.value.cameras;
+        setCameras(list);
+        const cur = selectedRef.current;
+        if (!cur || !list.some((x) => x.camera_id === cur)) {
+          const nextId = list.length > 0 ? list[0].camera_id : null;
+          if (nextId !== cur) {
+            selectedRef.current = nextId;
+            setSelectedCameraId(nextId);
+          }
+        }
+      }
+    } finally {
+      if (reqId === reqIdRef.current) inFlightRef.current = false;
+    }
+  }, []);
+
+  // Poll loop: sequential (no overlap), paused while the tab is hidden.
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      if (stopped) return;
+      if (!document.hidden) await refresh(true);
+      if (!stopped) timer = setTimeout(tick, POLL_MS);
+    };
+    const onVis = () => {
+      if (!document.hidden) {
+        clearTimeout(timer);
+        void tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    void tick();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      ctrlRef.current?.abort();
+      document.removeEventListener("visibilitychange", onVis);
+    };
   }, [refresh]);
+
+  // Camera switch: clear stale alerts, reset feed state, refetch immediately.
+  useEffect(() => {
+    setAlerts([]);
+    setSelectedEvidence(null);
+    setFeedLost(false);
+    void refresh(true);
+  }, [selectedCameraId, scope, refresh]);
+
+  // Feed lost: retry periodically with a cache-busting param.
+  useEffect(() => {
+    if (!feedLost) return;
+    const id = setInterval(() => setFeedBust((b) => b + 1), FEED_RETRY_MS);
+    return () => clearInterval(id);
+  }, [feedLost]);
 
   async function onAddCamera(e: FormEvent) {
     e.preventDefault();
@@ -88,22 +197,33 @@ export default function DashboardPage() {
       
       // 1. Create slot
       await createCamera(cid, newCameraLabel.trim());
-      
-      // 2. Connect
+
+      // 2. Connect. If this fails, roll back the slot we just created so the
+      // user can resubmit the same ID instead of hitting "already exists".
       if (ip.trim()) {
-        await connectCamera(cid, {
-          ip: ip.trim(),
-          port: Number(port) || 8080,
-          path: path.trim() || "/video",
-          wifi_name: wifiName.trim(),
-        });
+        try {
+          await connectCamera(cid, {
+            ip: ip.trim(),
+            port: Number(port) || 8080,
+            path: path.trim() || "/video",
+            wifi_name: wifiName.trim(),
+          });
+        } catch (connErr) {
+          try {
+            await deleteCamera(cid);
+          } catch {
+            /* best effort; slot may remain and can be removed from the list */
+          }
+          throw new Error(`Connect failed (camera slot removed): ${errMsg(connErr)}`);
+        }
       }
       setSelectedCameraId(cid);
       setNewCameraId("");
       setNewCameraLabel("");
       setIp("");
       setFeedKey((k) => k + 1);
-      await refresh();
+      setAddOpen(false);
+      await refresh(true);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Add camera failed");
     } finally {
@@ -117,10 +237,20 @@ export default function DashboardPage() {
     try {
       const cid = "webcam-" + Math.floor(Math.random() * 1000);
       await createCamera(cid, "Laptop Webcam");
-      await connectWebcam(cid);
+      try {
+        await connectWebcam(cid);
+      } catch (connErr) {
+        try {
+          await deleteCamera(cid);
+        } catch {
+          /* best effort */
+        }
+        throw new Error(`Webcam connect failed (slot removed): ${errMsg(connErr)}`);
+      }
       setSelectedCameraId(cid);
       setFeedKey((k) => k + 1);
-      await refresh();
+      setAddOpen(false);
+      await refresh(true);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Webcam connect failed");
     } finally {
@@ -134,7 +264,7 @@ export default function DashboardPage() {
     try {
       await disconnectCamera(cameraId);
       setFeedKey((k) => k + 1);
-      await refresh();
+      await refresh(true);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Disconnect failed");
     } finally {
@@ -149,9 +279,10 @@ export default function DashboardPage() {
     try {
       await deleteCamera(cameraId);
       if (selectedCameraId === cameraId) {
+        selectedRef.current = null;
         setSelectedCameraId(null);
       }
-      await refresh();
+      await refresh(true);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Remove failed");
     } finally {
@@ -190,10 +321,11 @@ export default function DashboardPage() {
     }
   }
 
-  async function onLabel(evidenceFile: string, label: "safe" | "unsafe") {
+  async function onLabel(evidenceFile: string, label: Verdict) {
     setLabelMsg(null);
     try {
       const res = await labelEvidence(evidenceFile, label);
+      setVerdicts((v) => ({ ...v, [evidenceFile]: label }));
       setLabelMsg(
         label === "safe"
           ? `Marked false alarm → ${res.copied_to}. ${res.hint}`
@@ -212,7 +344,9 @@ export default function DashboardPage() {
   
   const cameraKind = selectedCamStatus?.camera_kind || "none";
   let cameraLabelMsg = "Unknown";
-  if (!backendOnline) cameraLabelMsg = "Start the FastAPI backend";
+  if (authFailed) cameraLabelMsg = "API key missing/invalid";
+  else if (!backendOnline) cameraLabelMsg = "Start the FastAPI backend";
+  else if (selectedCamStatus?.frozen) cameraLabelMsg = "Feed frozen";
   else if (cameraConnected) {
     if (cameraKind === "webcam") cameraLabelMsg = "Laptop webcam connected";
     else if (selectedCamStatus?.wifi_name) cameraLabelMsg = `Connected on ${selectedCamStatus.wifi_name}`;
@@ -223,387 +357,225 @@ export default function DashboardPage() {
     cameraLabelMsg = "Disconnected";
   }
 
-  const raw = selectedCamStatus?.latest_raw_pct;
-  const smoothed = selectedCamStatus?.smoothed_avg_pct;
-  const threshold = selectedCamStatus?.alert_threshold ?? 60;
-  const scoreHot = smoothed != null && smoothed >= threshold;
+  const backendState = authFailed ? "unauthorized" : backendOnline ? "online" : "offline";
+  const onlineCount = cameras.filter((c) => c.camera_receiving).length;
+  const hotCameras = cameras.filter(
+    (c) => c.camera_receiving && c.smoothed_avg_pct != null && c.smoothed_avg_pct >= c.alert_threshold
+  );
+  const hotCam = hotCameras[0];
+  const reviewVisible = reviewBusy || reviewError || reviewResult;
 
   return (
-    <div className={styles.layoutContainer}>
-      {/* Sidebar for Cameras */}
-      <aside className={styles.sidebar}>
-        <div className={styles.sidebarSection}>
-          <Link href="/calibration" className={styles.sidebarTitle} style={{ display: 'block', textDecoration: 'none', background: 'rgba(255,255,255,0.1)', padding: '10px', borderRadius: '8px', marginBottom: '16px', color: '#fff', textAlign: 'center' }}>
-            Open Calibration Tools
-          </Link>
-          <h2 className={styles.sidebarTitle}>Cameras ({cameras.length})</h2>
-          {cameras.length === 0 && (
-            <p className={styles.hint}>No cameras configured yet.</p>
-          )}
-          <div className={styles.cameraList}>
-            {cameras.map((c) => (
-              <div 
-                key={c.camera_id} 
-                className={`${styles.cameraCard} ${selectedCameraId === c.camera_id ? styles.cameraCardActive : ''}`}
-                onClick={() => setSelectedCameraId(c.camera_id)}
-              >
-                <div className={styles.cameraCardHeader}>
-                  <h3 className={styles.cameraName}>{c.label || c.camera_id}</h3>
-                  <div className={`${styles.cameraStatus} ${c.camera_receiving ? styles.active : styles.offline}`}>
-                    <span className={styles.dot} />
-                    {c.camera_receiving ? "Live" : "Offline"}
-                  </div>
-                </div>
-                <p className={styles.cameraMeta}>
-                  {c.camera_kind === 'webcam' ? 'Webcam' : (c.ip ? c.ip : 'Disconnected')}
-                </p>
-              </div>
-            ))}
-          </div>
-        </div>
+    <>
+      <AppBar
+        active="monitor"
+        backend={{ state: backendState }}
+        watcherAgeMs={root?.watcher_last_cycle_age_ms}
+        modelVersion={root?.model_version}
+      />
 
-        <div className={styles.sidebarSection}>
-          <h2 className={styles.sidebarTitle}>Add Camera</h2>
-          <form className={styles.addCameraForm} onSubmit={onAddCamera}>
-            <label className={styles.field}>
-              <span>ID (e.g. cam-1)</span>
-              <input value={newCameraId} onChange={e => setNewCameraId(e.target.value)} required />
-            </label>
-            <label className={styles.field}>
-              <span>Label</span>
-              <input value={newCameraLabel} onChange={e => setNewCameraLabel(e.target.value)} placeholder="Main Hallway" />
-            </label>
-            <label className={styles.field}>
-              <span>Phone IP (Optional)</span>
-              <input value={ip} onChange={e => setIp(e.target.value)} placeholder="192.168.1.5" />
-            </label>
-            {ip && (
-              <>
-                <label className={styles.field}>
-                  <span>Port</span>
-                  <input value={port} onChange={e => setPort(e.target.value)} />
-                </label>
-                <label className={styles.field}>
-                  <span>Stream path</span>
-                  <input value={path} onChange={e => setPath(e.target.value)} />
-                </label>
-              </>
-            )}
-            <button type="submit" className={styles.primary} disabled={busy || !backendOnline}>
-              Add & Connect
-            </button>
-            <button type="button" className={styles.secondary} onClick={onAddWebcam} disabled={busy || !backendOnline}>
-              Add Webcam
-            </button>
-          </form>
-          {actionError && <p className={styles.error}>{actionError}</p>}
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
-      <main className={styles.mainContent}>
-        <header className={styles.hero} style={{ minHeight: 'auto', paddingTop: '1rem' }}>
-          <div className={styles.brandBlock}>
-            <p className={styles.eyebrow}>School safety monitor</p>
-            <h1 className={styles.brand}>SafeSpace</h1>
-            <p className={styles.tagline}>
-              Monitor multiple camera feeds, view live confidence scores, and review incident evidence.
-            </p>
-          </div>
-
-          <div className={styles.statusRow} aria-live="polite">
-            <div className={`${styles.statusPill} ${backendOnline ? styles.ok : styles.bad}`}>
-              <span className={styles.dot} />
-              Backend: {backendOnline ? "Online" : "Offline"}
+      <div className="gutter">
+        <div className="wrap">
+          <div className={styles.head}>
+            <div>
+              <h1>Live monitoring</h1>
+              <p className={styles.sub}>
+                {cameras.length} {cameras.length === 1 ? "camera" : "cameras"}, {hotCameras.length} above the alert
+                threshold.
+              </p>
             </div>
-            {selectedCamStatus && (
-              <div className={`${styles.statusPill} ${cameraConnected ? styles.ok : styles.bad}`}>
-                <span className={styles.dot} />
-                {selectedCamStatus.label || selectedCamStatus.camera_id}: {cameraLabelMsg}
-              </div>
-            )}
-          </div>
-        </header>
-
-        {selectedCamStatus ? (
-          <section className={styles.monitor} aria-labelledby="monitor-heading">
-            <div className={styles.sectionHead} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
-              <div>
-                <h2 id="monitor-heading">{selectedCamStatus.label || selectedCamStatus.camera_id}</h2>
-                <p>Live view and smoothed violence confidence.</p>
-              </div>
-              <div className={styles.actions}>
-                <button 
-                  type="button" 
-                  className={styles.secondary} 
-                  onClick={() => onDisconnect(selectedCamStatus.camera_id)} 
-                  disabled={!selectedCamStatus.camera_active || busy}
-                >
-                  Disconnect
-                </button>
-                <button 
-                  type="button" 
-                  className={styles.secondary} 
-                  onClick={() => onRemoveCamera(selectedCamStatus.camera_id)}
-                  disabled={busy}
-                >
-                  Remove
-                </button>
-              </div>
-            </div>
-            <div className={styles.monitorGrid}>
-              <div className={styles.previewFrame}>
-                {cameraConnected ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    key={`${selectedCameraId}-${feedKey}`}
-                    src={feedUrl(selectedCamStatus.camera_id)}
-                    alt={`Live feed from ${selectedCamStatus.label || selectedCamStatus.camera_id}`}
-                  />
-                ) : (
-                  <div className={styles.previewEmpty}>
-                    No live feed. Connect the camera to start monitoring.
-                  </div>
-                )}
-              </div>
-              <div className={styles.scores}>
-                <div className={styles.scoreBlock}>
-                  <span className={styles.scoreLabel}>Raw spike</span>
-                  <strong className={styles.scoreValue}>
-                    {raw != null ? `${raw.toFixed(1)}%` : "—"}
-                  </strong>
-                </div>
-                <div className={styles.scoreBlock}>
-                  <span className={styles.scoreLabel}>Smoothed average</span>
-                  <strong
-                    className={`${styles.scoreValue} ${
-                      scoreHot ? styles.scoreAlert : ""
-                    }`}
-                  >
-                    {smoothed != null ? `${smoothed.toFixed(1)}%` : "—"}
-                  </strong>
-                </div>
-                <div className={styles.meter}>
-                  <div className={styles.meterTrack}>
-                    <div
-                      className={styles.meterFill}
-                      style={{
-                        width: `${Math.min(100, Math.max(0, smoothed ?? 0))}%`,
-                      }}
-                    />
-                    <div
-                      className={styles.meterThreshold}
-                      style={{ left: `${threshold}%` }}
-                      title={`Alert threshold ${threshold}%`}
-                    />
-                  </div>
-                  <p className={styles.meterCaption}>
-                    Alert threshold {threshold}% · Buffer{" "}
-                    {selectedCamStatus?.buffer_fill ?? "—"} · Frames{" "}
-                    {selectedCamStatus?.total_frames ?? 0}
-                  </p>
-                  {selectedCamStatus?.scene?.note && (
-                    <p
-                      className={
-                        selectedCamStatus.scene.suitable_for_model
-                          ? styles.hint
-                          : styles.error
-                      }
-                    >
-                      Framing: {selectedCamStatus.scene.method} · subject{" "}
-                      {((selectedCamStatus.scene.subject_area_frac ?? 0) * 100).toFixed(1)}%
-                      {" — "}
-                      {selectedCamStatus.scene.note}
-                    </p>
-                  )}
-                </div>
-              </div>
-            </div>
-          </section>
-        ) : (
-          <section className={styles.monitor}>
-            <div className={styles.previewEmpty} style={{ border: '1px dashed var(--line)' }}>
-              Select or add a camera to view its live monitor.
-            </div>
-          </section>
-        )}
-
-        <section className={styles.feedSection} aria-labelledby="review-heading">
-          <div className={styles.sectionHead}>
-            <h2 id="review-heading">Review a recording</h2>
-            <p>
-              Upload a clip (or re-analyze evidence) to see if the model would alert —
-              useful for checking false positives.
-            </p>
-          </div>
-          <div className={styles.reviewRow}>
-            <label className={styles.fileBtn}>
+            <div className={styles.headActions}>
               <input
+                ref={fileInputRef}
                 type="file"
+                hidden
                 accept="video/mp4,video/*,.mp4,.mov,.avi,.mkv,.webm"
-                disabled={reviewBusy || !backendOnline}
                 onChange={(e) => {
                   const f = e.target.files?.[0] || null;
                   void onReviewFile(f);
                   e.target.value = "";
                 }}
               />
-              {reviewBusy ? "Analyzing…" : "Upload video to analyze"}
-            </label>
-          </div>
-          {reviewError && <p className={styles.error}>{reviewError}</p>}
-          {labelMsg && <p className={styles.hint}>{labelMsg}</p>}
-          {reviewResult && (
-            <div className={styles.reviewResult}>
-              <p
-                className={
-                  reviewResult.would_alert ? styles.verdictHot : styles.verdictOk
-                }
+              <button
+                type="button"
+                className="btn"
+                disabled={reviewBusy || !backendOnline}
+                onClick={() => fileInputRef.current?.click()}
               >
-                {reviewResult.would_alert
-                  ? "Would ALERT (model thinks this is violence)"
-                  : "Would stay SAFE (model does not alert)"}
-              </p>
-              <p className={styles.itemMeta}>
-                Peak smoothed {reviewResult.peak_smoothed_pct}% · Peak raw{" "}
-                {reviewResult.peak_raw_pct}% · Threshold{" "}
-                {reviewResult.alert_threshold_pct}% ·{" "}
-                {reviewResult.duration_sec}s analyzed
-              </p>
-              <p className={styles.hint}>{reviewResult.explanation}</p>
+                <Upload aria-hidden="true" />
+                {reviewBusy ? "Analyzing…" : "Upload video"}
+              </button>
+              <button type="button" className="btn btn-primary" onClick={() => setAddOpen(true)}>
+                <Plus aria-hidden="true" />
+                Add camera
+              </button>
+            </div>
+          </div>
+
+          {authFailed && (
+            <p className={styles.error} role="alert">
+              API key missing or invalid. Set NEXT_PUBLIC_SAFESPACE_KEY (see .env.example) and restart the frontend.
+            </p>
+          )}
+          {!authFailed && backendOnline && (errors.alerts || errors.logs || errors.root) && (
+            <p className={styles.notice} role="status">
+              {[
+                errors.alerts && `Alerts: ${errors.alerts}`,
+                errors.logs && `Logs: ${errors.logs}`,
+                errors.root && `Status: ${errors.root}`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          )}
+          {!authFailed && !backendOnline && hasLoaded.current && errors.cameras && (
+            <p className={styles.error} role="alert">
+              Cameras: {errors.cameras}
+            </p>
+          )}
+
+          {hotCam && (
+            <div className={styles.alertbar} role="alert">
+              <i className="dot dot-crit" />
+              <b>Possible fight on {hotCam.label || hotCam.camera_id}</b>
+              <span className="mono">
+                {hotCam.smoothed_avg_pct?.toFixed(0)}% confidence, above alert threshold
+              </span>
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={() => setSelectedCameraId(hotCam.camera_id)}
+              >
+                <Play aria-hidden="true" />
+                Watch live
+              </button>
             </div>
           )}
-        </section>
 
-        <section className={styles.feedSection} aria-labelledby="feed-heading">
-          <div className={styles.sectionHead}>
-            <h2 id="feed-heading">Alerts & logs</h2>
-            <p>Violence incidents with evidence, plus system connection events.</p>
-          </div>
-          <div className={styles.tabs}>
-            <button
-              type="button"
-              className={tab === "alerts" ? styles.tabActive : styles.tab}
-              onClick={() => setTab("alerts")}
-            >
-              Alerts ({alerts.length})
-            </button>
-            <button
-              type="button"
-              className={tab === "logs" ? styles.tabActive : styles.tab}
-              onClick={() => setTab("logs")}
-            >
-              Logs ({logs.length})
-            </button>
-          </div>
+          <StatBand
+            online={onlineCount}
+            total={cameras.length}
+            active={hotCameras.length}
+            alerts={alerts.length}
+            latestConfidence={selectedCamStatus?.smoothed_avg_pct ?? null}
+          />
 
-          {tab === "alerts" ? (
-            <div className={styles.list}>
-              {alerts.length === 0 && (
-                <p className={styles.empty}>
-                  {selectedCameraId ? "No alerts for this camera yet." : "No alerts yet."}
-                </p>
+          <main className={styles.grid}>
+            <div className={styles.stack}>
+              <section className={styles.panel} aria-labelledby="cameras-heading">
+                <div className={styles.panelHead}>
+                  <h2 id="cameras-heading">Cameras</h2>
+                  <span className="label">Red = above alert threshold</span>
+                </div>
+                <CameraWall
+                  cameras={cameras}
+                  selectedId={selectedCameraId}
+                  onSelect={setSelectedCameraId}
+                  onAdd={() => setAddOpen(true)}
+                />
+              </section>
+
+              {selectedCamStatus && (
+                <div className={styles.panel}>
+                  <MonitorPanel
+                    cam={selectedCamStatus}
+                    connected={cameraConnected}
+                    stateMessage={cameraLabelMsg}
+                    busy={busy}
+                    feedKey={feedKey}
+                    feedBust={feedBust}
+                    feedLost={feedLost}
+                    onFeedError={() => setFeedLost(true)}
+                    onFeedLoad={() => setFeedLost(false)}
+                    onDisconnect={() => onDisconnect(selectedCamStatus.camera_id)}
+                    onRemove={() => onRemoveCamera(selectedCamStatus.camera_id)}
+                  />
+                </div>
               )}
-              {alerts.map((alert) => {
-                const videoSrc = evidenceUrl(
-                  alert.evidence_url || alert.evidence_file
-                );
-                const isOpen = selectedEvidence === alert.evidence_file;
-                return (
-                  <article key={alert.timestamp + alert.evidence_file} className={styles.item}>
-                    <div className={styles.itemMain}>
-                      <div>
-                        <p className={styles.itemTitle}>
-                          Incident · {alert.confidence}% confidence
-                          {alert.camera_id && ` · [${alert.camera_id}]`}
-                        </p>
-                        <p className={styles.itemMeta}>{alert.timestamp}</p>
-                      </div>
-                      <div className={styles.itemActions}>
-                        <button
-                          type="button"
-                          className={styles.secondary}
-                          onClick={() =>
-                            setSelectedEvidence(isOpen ? null : alert.evidence_file)
-                          }
-                        >
-                          {isOpen ? "Hide clip" : "Play clip"}
-                        </button>
-                        <button
-                          type="button"
-                          className={styles.secondary}
-                          disabled={reviewBusy || !backendOnline}
-                          onClick={() => void onReanalyze(alert.evidence_file)}
-                        >
-                          Re-analyze
-                        </button>
-                        <button
-                          type="button"
-                          className={styles.secondary}
-                          onClick={() => void onLabel(alert.evidence_file, "safe")}
-                        >
-                          False alarm
-                        </button>
-                        <button
-                          type="button"
-                          className={styles.secondary}
-                          onClick={() => void onLabel(alert.evidence_file, "unsafe")}
-                        >
-                          True fight
-                        </button>
-                        <a
-                          className={styles.linkBtn}
-                          href={videoSrc}
-                          download
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Download
-                        </a>
-                      </div>
-                    </div>
-                    {isOpen && (
-                      <video
-                        className={styles.evidenceVideo}
-                        src={videoSrc}
-                        controls
-                        playsInline
-                        preload="metadata"
-                      />
+
+              {reviewVisible && (
+                <section className={styles.panel} aria-labelledby="review-heading">
+                  <div className={styles.panelHead}>
+                    <h2 id="review-heading">Recording review</h2>
+                    {!reviewBusy && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => {
+                          setReviewResult(null);
+                          setReviewError(null);
+                        }}
+                      >
+                        <X aria-hidden="true" />
+                        Dismiss
+                      </button>
                     )}
-                  </article>
-                );
-              })}
-            </div>
-          ) : (
-            <div className={styles.list}>
-              {logs.length === 0 && (
-                <p className={styles.empty}>No system logs yet.</p>
+                  </div>
+                  {reviewBusy && <p className={styles.sub}>Analyzing…</p>}
+                  {reviewError && <p className={styles.error}>{reviewError}</p>}
+                  {reviewResult && (
+                    <div className={styles.result}>
+                      <p className={reviewResult.would_alert ? styles.verdictHot : styles.verdictOk}>
+                        {reviewResult.would_alert
+                          ? "Would ALERT (model thinks this is violence)"
+                          : "Would stay SAFE (model does not alert)"}
+                      </p>
+                      <p className={`${styles.sub} mono`}>
+                        Peak smoothed {reviewResult.peak_smoothed_pct}% · Peak raw {reviewResult.peak_raw_pct}% ·
+                        Threshold {reviewResult.alert_threshold_pct}% · {reviewResult.duration_sec}s analyzed
+                      </p>
+                      <p className={styles.sub}>{reviewResult.explanation}</p>
+                    </div>
+                  )}
+                </section>
               )}
-              {logs.map((log, i) => (
-                <article
-                  key={`${log.timestamp}-${i}`}
-                  className={styles.logItem}
-                >
-                  <span
-                    className={`${styles.logLevel} ${
-                      log.level === "error" || log.level === "alert"
-                        ? styles.logHot
-                        : log.level === "warning"
-                          ? styles.logWarn
-                          : ""
-                    }`}
-                  >
-                    {log.kind}/{log.level}
-                  </span>
-                  <span className={styles.logTime}>{log.timestamp}</span>
-                  <p className={styles.logMsg}>{log.message}</p>
-                </article>
-              ))}
             </div>
-          )}
-        </section>
-      </main>
-    </div>
+
+            <aside className={styles.panel}>
+              <AlertFeed
+                tab={tab}
+                onTab={setTab}
+                scope={scope}
+                onScope={setScope}
+                hasSelectedCamera={Boolean(selectedCameraId)}
+                alerts={alerts}
+                logs={logs}
+                openEvidence={selectedEvidence}
+                onOpen={setSelectedEvidence}
+                verdicts={verdicts}
+                reviewBusy={reviewBusy}
+                backendOnline={backendOnline}
+                onReanalyze={(f) => void onReanalyze(f)}
+                onLabel={(f, l) => void onLabel(f, l)}
+                labelMsg={labelMsg}
+              />
+            </aside>
+          </main>
+        </div>
+      </div>
+
+      <AddCameraDialog
+        open={addOpen}
+        onClose={() => {
+          setAddOpen(false);
+          setActionError(null);
+        }}
+        onSubmit={onAddCamera}
+        onAddWebcam={onAddWebcam}
+        busy={busy}
+        backendOnline={backendOnline}
+        error={actionError}
+        id={newCameraId}
+        setId={setNewCameraId}
+        label={newCameraLabel}
+        setLabel={setNewCameraLabel}
+        ip={ip}
+        setIp={setIp}
+        port={port}
+        setPort={setPort}
+        path={path}
+        setPath={setPath}
+      />
+    </>
   );
 }
