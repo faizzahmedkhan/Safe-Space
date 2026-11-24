@@ -1,4 +1,6 @@
 import cv2
+import logging
+import queue
 import time
 import threading
 import socket
@@ -7,12 +9,29 @@ import urllib.request
 import urllib.error
 import numpy as np
 from collections import deque
-from typing import Optional, Tuple
+from datetime import datetime
+from typing import Callable, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 from frame_prep import prepare_for_model
+from clip_sampler import ClipWindow, detect_gap
+from thresholds import (
+  CAMERA_TARGET_FPS,
+  CLIP_LENGTH,
+  DEGRADED_FPS,
+  MAX_FRAME_GAP_S,
+)
 
-CLIP_LENGTH = 16
+log = logging.getLogger("safespace.camera")
+
 EVIDENCE_BUFFER_LEN = 60
+# Frozen-stream detection: mean abs diff of a tiny grey frame below this for
+# FROZEN_SECONDS means the camera is repeating the same image.
+FROZEN_DIFF = 0.5
+FROZEN_SECONDS = 3.0
+# Writer queue bound (frames).  If the disk/encoder cannot keep up, frames are
+# dropped from the evidence file rather than slowing capture (which would
+# also corrupt the model's time base).
+EVIDENCE_QUEUE_FRAMES = 120
 HTTP_USER_AGENT = "SafeSpace/1.0 (IP-Webcam client)"
 
 
@@ -281,7 +300,7 @@ class _HttpFrameSource:
       frame = self._read_mjpeg_frame()
       return (frame is not None), frame
     except Exception as e:
-      print(f"[PRODUCER] HTTP frame read error: {e}")
+      log.warning("HTTP frame read error: %s", e)
       return False, None
 
   def isOpened(self) -> bool:
@@ -306,8 +325,145 @@ class _HttpFrameSource:
     self._close_conn()
 
 
+class _LatestFrameReader:
+  """A2: reads an OpenCV network stream (RTSP/MJPEG) continuously on its own
+  thread and only keeps the newest frame.  The old code did grab() x5 + read()
+  per loop, which discarded 4 of every 5 frames and made a clip span ~2.7 s."""
+
+  def __init__(self, cap):
+    self._cap = cap
+    self._cond = threading.Condition()
+    self._frame = None
+    self._ts = None
+    self._seq = 0
+    self._last_seq = 0
+    self._fail = 0
+    self._stop = threading.Event()
+    self._thread = threading.Thread(target=self._run, daemon=True)
+    self._thread.start()
+
+  def _run(self):
+    while not self._stop.is_set():
+      try:
+        ok, frame = self._cap.read()
+      except Exception:
+        ok, frame = False, None
+      if ok and frame is not None:
+        ts = time.monotonic()
+        with self._cond:
+          self._frame, self._ts = frame, ts
+          self._seq += 1
+          self._fail = 0
+          self._cond.notify_all()
+      else:
+        with self._cond:
+          self._fail += 1
+        time.sleep(0.05)
+
+  def read(self, timeout: float = 1.0):
+    """Returns (grabbed, frame, ts).  grabbed=False if no NEW frame arrived."""
+    with self._cond:
+      self._cond.wait_for(
+        lambda: self._seq != self._last_seq or self._stop.is_set(), timeout=timeout
+      )
+      if self._seq == self._last_seq:
+        return False, None, None
+      self._last_seq = self._seq
+      return True, self._frame, self._ts
+
+  def isOpened(self) -> bool:
+    return (not self._stop.is_set()) and self._cap.isOpened()
+
+  def release(self):
+    self._stop.set()
+    with self._cond:
+      self._cond.notify_all()
+    self._thread.join(timeout=2.0)
+    try:
+      self._cap.release()
+    except Exception:
+      pass
+
+
+class _EvidenceRecorder:
+  """A4: evidence is encoded on its own thread, fed through a bounded queue,
+  so VideoWriter latency never slows the capture loop."""
+
+  def __init__(self, path, size, fps, preroll, on_done):
+    self.path = path
+    self.size = size
+    self.fps = fps
+    self._preroll = preroll
+    self._on_done = on_done
+    self._q = queue.Queue(maxsize=EVIDENCE_QUEUE_FRAMES)
+    self._finish = threading.Event()
+    self.dropped = 0
+    self.written = 0
+    self.opened = threading.Event()
+    self._ok = False
+    self._thread = threading.Thread(target=self._run, daemon=True)
+
+  def start(self):
+    self._thread.start()
+
+  def push(self, frame) -> bool:
+    try:
+      self._q.put_nowait(frame)
+      return True
+    except queue.Full:
+      self.dropped += 1
+      return False
+
+  def finish(self):
+    self._finish.set()
+
+  def _run(self):
+    writer = None
+    ok = False
+    try:
+      # mp4v is reliable in OpenCV; it is transcoded to H.264 afterwards.
+      fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+      writer = cv2.VideoWriter(self.path, fourcc, self.fps, self.size)
+      if not writer.isOpened():
+        log.error("Failed to open VideoWriter for %s", self.path)
+        writer = None
+        return
+      for f in self._preroll:
+        writer.write(f)
+        self.written += 1
+      self._preroll = None
+      while True:
+        try:
+          frame = self._q.get(timeout=0.25)
+        except queue.Empty:
+          if self._finish.is_set():
+            break
+          continue
+        writer.write(frame)
+        self.written += 1
+      ok = self.written > 0
+    except Exception as e:
+      log.error("Evidence writer error for %s: %s", self.path, e)
+    finally:
+      if writer is not None:
+        try:
+          writer.release()
+        except Exception:
+          pass
+      if self.dropped:
+        log.warning("Evidence %s: dropped %d frame(s) (encoder too slow)", self.path, self.dropped)
+      try:
+        self._on_done(self.path, ok)
+      except Exception as e:
+        log.error("Evidence completion callback failed: %s", e)
+
+
+def _clamp(v, lo, hi):
+  return max(lo, min(hi, v))
+
+
 class CameraStream:
-  def __init__(self, src=0, target_fps=15, show_preview=True, soft_fail=True):
+  def __init__(self, src=0, target_fps=CAMERA_TARGET_FPS, show_preview=True, soft_fail=True):
     """
     src=0 opens the default laptop webcam.
     src="http://..." opens a network camera stream (HTTP IP Webcam preferred).
@@ -318,37 +474,45 @@ class CameraStream:
     self.preview_enabled = show_preview
     self.soft_fail = soft_fail
 
-    self.frame_buffer = deque(maxlen=CLIP_LENGTH)
+    # Timestamped inference window (A1).  Each entry is one prepared 112x112
+    # RGB frame with its real arrival time (time.monotonic()).
+    self.window = ClipWindow(n=CLIP_LENGTH, fps=CAMERA_TARGET_FPS)
     self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
     self.max_evidence_mb = 150
     self.evidence_buffer_initialized = False
 
-    # Rolling actual-fps measurement. target_fps is what we *ask* for; this
-    # tracks what we're *actually* sustaining. The capture loop's own pacing
-    # (time.sleep(remaining)) silently degrades to whatever fps a struggling
-    # camera can sustain with no correction and no signal anywhere — this
-    # makes that visible instead of silent, since a camera running well
-    # under its target fps feeds the model clips that span more real-world
-    # time than the model was trained on (quiet accuracy drift, not a crash).
+    # Rolling arrival timestamps -> real fps.
     self._loop_timestamps = deque(maxlen=30)
     self._fps_warn_counter = 0
+    self.degraded = False
 
     self._lock = threading.Lock()
     self._thread = None
 
     self.frame_count = 0
-    self.video_writer = None
+    self._recorder: Optional[_EvidenceRecorder] = None
     self._recording_path = None
-    self.last_frame_time = None
+    # Called from the writer thread as cb(path, ok) once the file is closed.
+    self.on_recording_finished: Optional[Callable[[str, bool], None]] = None
+    self.last_frame_time = None      # time.monotonic() of newest frame
     self.open_error = None
     self._prev_gray = None
-    self._person_box = None
-    self._person_detect_counter = 0
+    self._crop_state: dict = {}
+    # A3/C7: bumped on every discontinuity (grab failure, frame gap, restart).
+    self.generation = 0
+    self.last_reset_reason = "init"
+    # E3: frozen-stream detection
+    self._prev_small = None
+    self._frozen_since = None
+    self.frozen = False
+    # E2/E3: wall-clock time (epoch) the camera stopped delivering frames.
+    self.offline_since: Optional[float] = None
     self.scene_meta = {
         "suitable_for_model": True,
         "subject_area_frac": 0.0,
         "method": "full_frame",
         "note": "",
+        "global_motion": False,
       }
 
     self.stream = None
@@ -358,6 +522,7 @@ class CameraStream:
 
     self._open_source(src)
 
+  # ------------------------------------------------------------------ open
   def _open_source(self, src):
     """Open capture for src. Returns True on success."""
     if src is None:
@@ -380,7 +545,7 @@ class CameraStream:
         self.stream = None
         self.stopped = True
         self.open_error = diag["message"]
-        print(f"[PRODUCER] {self.open_error}")
+        log.warning("%s", self.open_error)
         if not self.soft_fail:
           raise RuntimeError(self.open_error)
         return False
@@ -391,13 +556,13 @@ class CameraStream:
         self.stream = None
         self.stopped = True
         self.open_error = err or f"Failed to open HTTP camera {src}"
-        print(f"[PRODUCER] {self.open_error}")
+        log.warning("%s", self.open_error)
         if not self.soft_fail:
           raise RuntimeError(self.open_error)
         return False
 
       self.stream = http_src
-      print(f"[PRODUCER] HTTP camera opened ({http_src._mode}) via {http_src.url}")
+      log.info("HTTP camera opened (%s) via %s", http_src._mode, http_src.url)
       self.stopped = False
       return True
 
@@ -408,18 +573,21 @@ class CameraStream:
       self.stream = None
       self.stopped = True
       self.open_error = f"Failed to open camera with src={src}"
-      print(f"[PRODUCER] {self.open_error}")
+      log.warning("%s", self.open_error)
       if not self.soft_fail:
         raise RuntimeError(self.open_error)
       return False
 
-    self.stream = stream
     if self.is_network_stream:
       try:
-        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
       except Exception:
         pass
-      print("[PRODUCER] Network stream detected (OpenCV). Buffer minimized.")
+      # A2: dedicated latest-frame reader thread.
+      self.stream = _LatestFrameReader(stream)
+      log.info("Network stream detected (OpenCV). Using latest-frame reader thread.")
+    else:
+      self.stream = stream
 
     self.stopped = False
     return True
@@ -427,46 +595,56 @@ class CameraStream:
   def start(self):
     """Starts the background thread to continuously read frames."""
     if self.stream is None or not self.stream.isOpened():
-      print("[PRODUCER] Camera not open — start() skipped.")
+      log.info("Camera not open - start() skipped.")
       return self
     if self._thread is not None and self._thread.is_alive():
       return self
     self.stopped = False
-    print("[PRODUCER] Starting camera thread...")
+    log.info("Starting camera thread...")
     self._thread = threading.Thread(target=self.update, args=(), daemon=True)
     self._thread.start()
     return self
+
+  def _reset_continuity(self, reason: str):
+    """A3: forget everything that spans a discontinuity so old and new
+    footage are never glued into one clip."""
+    with self._lock:
+      self.window.clear()
+      self._prev_gray = None
+      self._crop_state = {}
+      self._prev_small = None
+      self._frozen_since = None
+      self.frozen = False
+      self._loop_timestamps.clear()
+      self.generation += 1
+      self.last_reset_reason = reason
 
   def restart(self, src):
     """
     Stop the current stream, open a new source, clear buffers, and start capturing.
     Returns (success: bool, error: str | None).
     """
-    print(f"[PRODUCER] Restarting camera with src={src}")
+    log.info("Restarting camera with src=%s", src)
     old_thread = self._thread
     self.stop()
     if old_thread is not None and old_thread.is_alive():
       old_thread.join(timeout=2.0)
 
+    self._reset_continuity("restart")
     with self._lock:
-      self.frame_buffer.clear()
-      self.evidence_buffer.clear()
       self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
       self.evidence_buffer_initialized = False
       self.frame_count = 0
       self.last_frame_time = None
-      self._loop_timestamps.clear()
       self._fps_warn_counter = 0
-      self.video_writer = None
-      self._recording_path = None
-      self._prev_gray = None
-      self._person_box = None
-      self._person_detect_counter = 0
+      self.degraded = False
+      self.offline_since = None
       self.scene_meta = {
         "suitable_for_model": True,
         "subject_area_frac": 0.0,
         "method": "full_frame",
         "note": "",
+        "global_motion": False,
       }
 
     if not self._open_source(src):
@@ -475,45 +653,78 @@ class CameraStream:
     self.start()
     return True, None
 
+  # --------------------------------------------------------------- capture
+  def _read_frame(self, stream):
+    """Returns (grabbed, frame, arrival_ts_monotonic)."""
+    if isinstance(stream, _LatestFrameReader):
+      return stream.read(timeout=1.0)
+    grabbed, frame = stream.read()
+    return grabbed, frame, time.monotonic()
+
+  def _update_frozen(self, frame, ts):
+    small = cv2.cvtColor(cv2.resize(frame, (64, 48), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    prev = self._prev_small
+    self._prev_small = small
+    if prev is None:
+      return
+    diff = float(np.mean(cv2.absdiff(prev, small)))
+    if diff < FROZEN_DIFF:
+      if self._frozen_since is None:
+        self._frozen_since = ts
+      elif ts - self._frozen_since >= FROZEN_SECONDS:
+        self.frozen = True
+    else:
+      self._frozen_since = None
+      self.frozen = False
+
   def update(self):
     """This function runs on an infinite loop in the background."""
     sleep_time = 1.0 / self.target_fps
     consecutive_failures = 0
     max_consecutive_failures = 30
-    use_http = isinstance(self.stream, _HttpFrameSource)
+    next_deadline = time.perf_counter()
+    last_ts = None
 
     while not self.stopped:
-      loop_start = time.perf_counter()
-
-      if self.stream is None or not self.stream.isOpened():
-        print("[PRODUCER] Stream closed unexpectedly.")
+      stream = self.stream
+      if stream is None or not stream.isOpened():
+        log.warning("Stream closed unexpectedly.")
+        if self.offline_since is None:
+          self.offline_since = time.time()
         self.stop()
         break
 
-      if use_http:
-        grabbed, frame = self.stream.read()
-      elif self.is_network_stream:
-        for _ in range(5):
-          self.stream.grab()
-        grabbed, frame = self.stream.read()
-      else:
-        grabbed, frame = self.stream.read()
+      grabbed, frame, ts = self._read_frame(stream)
 
       if not grabbed or frame is None:
         consecutive_failures += 1
-        wait_time = min(2 ** (consecutive_failures - 1), 30)
-        print(
-          f"[PRODUCER] Frame grab failed ({consecutive_failures}/"
-          f"{max_consecutive_failures}). Retrying in {wait_time}s..."
+        if consecutive_failures == 1:
+          # A3: first failure of a streak invalidates the clip window.
+          self._reset_continuity("grab_failure")
+          if self.offline_since is None:
+            self.offline_since = time.time()
+          last_ts = None
+        wait_time = min(2 ** (consecutive_failures - 1), 5)
+        log.warning(
+          "Frame grab failed (%d/%d). Retrying in %ss...",
+          consecutive_failures, max_consecutive_failures, wait_time,
         )
         if consecutive_failures >= max_consecutive_failures:
-          print("[PRODUCER] Camera disconnected. Too many failures. Giving up.")
+          log.error("Camera disconnected. Too many failures. Giving up.")
           self.stop()
           break
         time.sleep(wait_time)
+        next_deadline = time.perf_counter()
         continue
 
       consecutive_failures = 0
+      self.offline_since = None
+
+      # A3: a long gap between frames (slow network, stall) must not be glued
+      # into one clip, nor produce a whole-frame motion diff.
+      if detect_gap(last_ts, ts, MAX_FRAME_GAP_S):
+        self._reset_continuity("gap")
+      last_ts = ts
 
       if not self.evidence_buffer_initialized:
         frame_bytes = frame.nbytes
@@ -521,75 +732,137 @@ class CameraStream:
         max_frames = max(max_frames, CLIP_LENGTH)
         self.evidence_buffer = deque(maxlen=max_frames)
         self.evidence_buffer_initialized = True
-        print(
-          f"[PRODUCER] Evidence buffer capped at {max_frames} frames "
-          f"({self.max_evidence_mb} MB)"
-        )
+        log.info("Evidence buffer capped at %d frames (%s MB)", max_frames, self.max_evidence_mb)
 
-      # Crop/zoom toward people/motion so 112x112 isn't empty hallway,
-      # and track whether subjects are large enough for this model.
-      # HOG person detect is expensive — run every 10 frames.
-      self._person_detect_counter = (self._person_detect_counter + 1) % 10
-      run_hog = self._person_detect_counter == 1
-      frame_rgb, scene_meta, self._prev_gray, self._person_box = prepare_for_model(
+      # B1: live matches training - HOG person detector OFF, no person-box
+      # cache (the old never-expiring cache pinned the crop to a stale spot).
+      frame_rgb, scene_meta, self._prev_gray = prepare_for_model(
         frame,
         self._prev_gray,
-        person_box_cache=self._person_box,
-        run_person_detector=run_hog,
+        person_box_cache=None,
+        run_person_detector=False,
+        crop_state=self._crop_state,
       )
+      self._update_frozen(frame, ts)
 
       with self._lock:
-        self.frame_buffer.append(frame_rgb)
+        self.window.add(
+          ts,
+          frame_rgb,
+          suitable=scene_meta.get("suitable_for_model", True),
+          global_motion=scene_meta.get("global_motion", False),
+        )
         self.evidence_buffer.append(frame)
         self.frame_count += 1
-        self.last_frame_time = time.time()
-        self._loop_timestamps.append(self.last_frame_time)
+        self.last_frame_time = ts
+        self._loop_timestamps.append(ts)
         self.scene_meta = scene_meta
+        recorder = self._recorder
 
-        if self.video_writer is not None:
-          self.video_writer.write(frame)
+      if recorder is not None:
+        recorder.push(frame)
 
-      # Every ~30 frames, check whether we're actually keeping pace with
-      # target_fps. This never blocks or corrects anything — pacing stays
-      # as-is — it just surfaces drift that was previously invisible.
+      # Real fps -> degraded flag (A1), with a little hysteresis.
       self._fps_warn_counter += 1
+      actual = self.get_actual_fps()
+      if actual is not None and len(self._loop_timestamps) >= 10:
+        if actual < DEGRADED_FPS:
+          if not self.degraded:
+            log.warning(
+              "Camera degraded: %.1f fps < %.0f fps. Alerts cannot open until it recovers.",
+              actual, DEGRADED_FPS,
+            )
+          self.degraded = True
+        elif actual >= DEGRADED_FPS + 1.0:
+          self.degraded = False
       if self._fps_warn_counter >= 30:
         self._fps_warn_counter = 0
-        actual = self.get_actual_fps()
         if actual is not None and actual < 0.8 * self.target_fps:
-          print(
-            f"[PRODUCER] fps drift: sustaining {actual:.1f}fps vs "
-            f"target {self.target_fps}fps — clips will span more real time "
-            f"than expected."
+          log.warning(
+            "fps drift: sustaining %.1f fps vs target %s fps (clips are time-resampled)",
+            actual, self.target_fps,
           )
 
-      # Pace both local and HTTP snapshot mode
-      elapsed = time.perf_counter() - loop_start
-      remaining = sleep_time - elapsed
+      # Deadline-based pacing (no cumulative drift).
+      next_deadline += sleep_time
+      now = time.perf_counter()
+      remaining = next_deadline - now
       if remaining > 0:
         time.sleep(remaining)
+      else:
+        next_deadline = now
 
+  # ---------------------------------------------------------------- queries
   def get_buffer(self):
+    """RGB frames of the latest clip window (<= CLIP_LENGTH, oldest first)."""
     with self._lock:
-      return list(self.frame_buffer)
+      return list(self.window.items)[-CLIP_LENGTH:]
+
+  def get_buffer_fill(self):
+    with self._lock:
+      n = min(CLIP_LENGTH, self.window.available_in_span())
+      ready = self.window.sample() is not None
+    return (CLIP_LENGTH if ready else min(n, CLIP_LENGTH - 1)), ready
 
   def get_evidence_buffer(self):
     with self._lock:
       return list(self.evidence_buffer)
 
-  def get_snapshot(self):
+  def get_inference_snapshot(self):
+    """Everything the watcher needs, taken atomically.  `ready` is True when a
+    full 15 fps-timeline clip can be sampled from timestamped frames."""
     with self._lock:
-      return list(self.frame_buffer), list(self.evidence_buffer), self.frame_count
+      sample = self.window.sample()
+      meta = dict(self.scene_meta)
+      gen = self.generation
+      reason = self.last_reset_reason
+      count = self.frame_count
+      last = self.last_frame_time
+    age_s = None if last is None else time.monotonic() - last
+    snap = {
+      "ready": sample is not None,
+      "generation": gen,
+      "reset_reason": reason,
+      "frame_count": count,
+      "age_s": age_s,
+      "degraded": self.degraded,
+      "frames": None,
+      "t_end": None,
+      "suitable": True,
+      "global_motion": False,
+      "scene": meta,
+    }
+    if sample is not None:
+      snap.update(
+        frames=sample["items"],
+        t_end=sample["t_end"],
+        suitable=sample["suitable"],
+        global_motion=sample["global_motion"],
+        span_s=sample["span_s"],
+      )
+      # Clip-level (not last-frame) suitability, B4.
+      snap["scene"] = {**meta, "suitable_for_model": bool(sample["suitable"]),
+                       "global_motion": bool(sample["global_motion"])}
+    return snap
 
   def get_scene_meta(self):
     with self._lock:
-      return dict(self.scene_meta)
+      meta = dict(self.scene_meta)
+      sample = self.window.sample()
+    if sample is not None:
+      meta["suitable_for_model"] = bool(sample["suitable"])
+      meta["global_motion"] = bool(sample["global_motion"])
+    return meta
+
+  def get_generation(self):
+    with self._lock:
+      return self.generation
 
   def get_last_frame_age_ms(self):
     with self._lock:
       if self.last_frame_time is None:
         return None
-      return round((time.time() - self.last_frame_time) * 1000, 1)
+      return round((time.monotonic() - self.last_frame_time) * 1000, 1)
 
   def get_actual_fps(self):
     """Rolling fps measured from real frame-arrival timestamps (last ~30 frames)."""
@@ -601,6 +874,12 @@ class CameraStream:
     if span <= 0:
       return None
     return round((len(ts) - 1) / span, 2)
+
+  def get_offline_since_iso(self):
+    t = self.offline_since
+    if t is None:
+      return None
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
 
   def set_evidence_budget_mb(self, max_evidence_mb: float):
     """
@@ -627,45 +906,55 @@ class CameraStream:
     _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return jpeg.tobytes()
 
-  def start_recording(self, filename):
+  # -------------------------------------------------------------- recording
+  def is_recording(self):
     with self._lock:
-      if self.video_writer is not None:
-        return
+      return self._recorder is not None
 
+  def start_recording(self, filename) -> bool:
+    """Open an evidence file on a writer thread.  C3: the file is written at
+    the MEASURED fps (clamped 1-30) so playback matches real time."""
+    with self._lock:
+      if self._recorder is not None:
+        return True
       if not self.evidence_buffer:
-        return
-
+        return False
       height, width = self.evidence_buffer[0].shape[:2]
-      # Record with mp4v (reliable in OpenCV); transcode to H.264 on stop for browsers.
-      fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-      self.video_writer = cv2.VideoWriter(
-        filename, fourcc, self.target_fps, (width, height)
+      fps = self.get_actual_fps_unlocked()
+      fps = _clamp(fps if fps else float(self.target_fps), 1.0, 30.0)
+      rec = _EvidenceRecorder(
+        filename, (width, height), fps, list(self.evidence_buffer), self._recording_done
       )
-      if not self.video_writer.isOpened():
-        self.video_writer = None
-        print(f"[PRODUCER] Failed to open VideoWriter for {filename}")
-        return
-
+      self._recorder = rec
       self._recording_path = filename
-      for f in self.evidence_buffer:
-        self.video_writer.write(f)
+    rec.start()
+    return True
+
+  def get_actual_fps_unlocked(self):
+    ts = list(self._loop_timestamps)
+    if len(ts) < 2:
+      return None
+    span = ts[-1] - ts[0]
+    if span <= 0:
+      return None
+    return (len(ts) - 1) / span
+
+  def _recording_done(self, path, ok):
+    cb = self.on_recording_finished
+    if cb is not None:
+      cb(path, ok)
 
   def stop_recording(self):
-    path = None
+    """Non-blocking: the writer thread drains its queue, closes the file and
+    then reports through on_recording_finished(path, ok)."""
     with self._lock:
-      if self.video_writer is not None:
-        self.video_writer.release()
-        self.video_writer = None
-        path = self._recording_path
-        self._recording_path = None
-
-    if path:
-      try:
-        from evidence_video import make_browser_compatible
-
-        make_browser_compatible(path)
-      except Exception as e:
-        print(f"[PRODUCER] Evidence browser transcode skipped: {e}")
+      rec = self._recorder
+      path = self._recording_path
+      self._recorder = None
+      self._recording_path = None
+    if rec is not None:
+      rec.finish()
+    return path
 
   def get_frame_count(self):
     with self._lock:
@@ -696,23 +985,18 @@ class CameraStream:
 
 
 if __name__ == "__main__":
-  cam = CameraStream(src=0, target_fps=6, show_preview=True, soft_fail=False).start()
+  logging.basicConfig(level=logging.INFO)
+  cam = CameraStream(src=0, target_fps=CAMERA_TARGET_FPS, show_preview=True, soft_fail=False).start()
 
   time.sleep(1)
 
   try:
     while True:
-      current_buffer = cam.get_buffer()
-
-      if len(current_buffer) == CLIP_LENGTH:
-        print(
-          f"✅ Buffer Full: {len(current_buffer)} frames ready. "
-          f"Shape of one frame: {current_buffer[0].shape} | "
-          f"Total captured: {cam.get_frame_count()}"
-        )
-      else:
-        print(f"⏳ Buffering... {len(current_buffer)}/{CLIP_LENGTH} frames")
-
+      fill, ready = cam.get_buffer_fill()
+      print(
+        f"clip ready={ready} fill={fill}/{CLIP_LENGTH} "
+        f"fps={cam.get_actual_fps()} total={cam.get_frame_count()}"
+      )
       time.sleep(1)
 
   except KeyboardInterrupt:

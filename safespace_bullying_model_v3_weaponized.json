@@ -1,0 +1,4 @@
+{
+  "alert_threshold": 0.67,
+  "spike_threshold": 0.90
+}

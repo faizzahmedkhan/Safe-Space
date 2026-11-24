@@ -25,6 +25,23 @@ MIN_SUBJECT_AREA_FRAC = 0.05
 # (avoids blowing up pure compression noise).
 MIN_CROP_SIDE_FRAC = 0.35
 
+# B2: optional EMA smoothing of the crop square across frames, so the "camera"
+# does not zoom/pan jitter inside one 16-frame clip.
+# WARNING: the model was TRAINED with per-frame (unsmoothed) crops.  Turning
+# this on changes the model's input distribution, so it requires the same
+# change in the training pipeline (notebook + train.py) and a retrain before
+# enabling.  Off by default; also inactive unless the caller passes crop_state.
+SMOOTH_CROP = False
+SMOOTH_ALPHA = 0.3
+# Max change of the crop centre/side per frame, as a fraction of the shorter side.
+SMOOTH_MAX_STEP_FRAC = 0.10
+
+# B3: a frame is "global motion" (camera shake, light switch, auto-exposure)
+# when the moving area exceeds this fraction of the frame, or the mean
+# brightness jumps by more than GLOBAL_BRIGHTNESS_JUMP grey levels.
+GLOBAL_MOTION_AREA_FRAC = 0.60
+GLOBAL_BRIGHTNESS_JUMP = 25.0
+
 
 # IMPORTANT: with multiple cameras, prepare_for_model() is called concurrently
 # from N different CameraStream producer threads. cv2.HOGDescriptor is not
@@ -46,7 +63,7 @@ def _get_hog():
     return hog
 
 
-def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndarray:
+def _square_rect(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> Tuple[int, int, int]:
     h, w = frame.shape[:2]
     side = max(bw, bh)
     min_side = int(min(h, w) * MIN_CROP_SIDE_FRAC)
@@ -57,7 +74,35 @@ def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndar
     cy = y + bh // 2
     x0 = max(0, min(w - side, cx - side // 2))
     y0 = max(0, min(h - side, cy - side // 2))
+    return x0, y0, side
+
+
+def _square_crop(frame: np.ndarray, x: int, y: int, bw: int, bh: int) -> np.ndarray:
+    x0, y0, side = _square_rect(frame, x, y, bw, bh)
     return frame[y0 : y0 + side, x0 : x0 + side]
+
+
+def _smooth_rect(
+    frame: np.ndarray, rect: Tuple[int, int, int], state: dict
+) -> Tuple[int, int, int]:
+    """EMA + rate limit on (cx, cy, side).  Only used when SMOOTH_CROP."""
+    h, w = frame.shape[:2]
+    x0, y0, side = rect
+    cur = (x0 + side / 2.0, y0 + side / 2.0, float(side))
+    prev = state.get("rect")
+    if prev is None:
+        new = cur
+    else:
+        step = SMOOTH_MAX_STEP_FRAC * min(h, w)
+        new = tuple(
+            p + max(-step, min(step, SMOOTH_ALPHA * (c - p))) for p, c in zip(prev, cur)
+        )
+    state["rect"] = new
+    cx, cy, sd = new
+    sd = int(max(1, min(sd, min(h, w))))
+    nx = int(max(0, min(w - sd, cx - sd / 2.0)))
+    ny = int(max(0, min(h - sd, cy - sd / 2.0)))
+    return nx, ny, sd
 
 
 def _detect_person_box(frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -93,26 +138,31 @@ def _detect_person_box(frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]
 
 def _detect_motion_box(
     frame: np.ndarray, prev_gray: Optional[np.ndarray]
-) -> Tuple[Optional[Tuple[int, int, int, int]], np.ndarray]:
+) -> Tuple[Optional[Tuple[int, int, int, int]], np.ndarray, float, float]:
+    """Returns (box, gray, motion_area_frac, brightness_jump).  The box/gray
+    values are identical to the pre-B3 implementation; the last two are extra
+    statistics used only for the global_motion flag."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     if prev_gray is None or prev_gray.shape != gray.shape:
-        return None, gray
+        return None, gray, 0.0, 0.0
 
+    brightness_jump = abs(float(gray.mean()) - float(prev_gray.mean()))
     diff = cv2.absdiff(prev_gray, gray)
     _, th = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    motion_frac = float(np.count_nonzero(th)) / float(th.size)
     th = cv2.dilate(th, np.ones((5, 5), np.uint8), iterations=2)
     contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None, gray
+        return None, gray, motion_frac, brightness_jump
     c = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(c)
     h, w = frame.shape[:2]
     if area < 0.002 * (h * w):
-        return None, gray
+        return None, gray, motion_frac, brightness_jump
     x, y, bw, bh = cv2.boundingRect(c)
-    return (x, y, bw, bh), gray
+    return (x, y, bw, bh), gray, motion_frac, brightness_jump
 
 
 def prepare_for_model(
@@ -120,12 +170,21 @@ def prepare_for_model(
     prev_gray: Optional[np.ndarray] = None,
     person_box_cache: Optional[Tuple[int, int, int, int]] = None,
     run_person_detector: bool = True,
-) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray, Optional[Tuple[int, int, int, int]]]:
+    crop_state: Optional[dict] = None,
+) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
     """
     Build a 112x112 RGB frame for the model + suitability metadata.
 
     Returns:
-      rgb_112, meta, gray_for_next_frame, person_box_cache
+      rgb_112, meta, gray_for_next_frame
+      (meta["person_box"] is the person box when method == "person_crop", else None;
+       callers that cache the HOG box should read it from there.)
+      meta["global_motion"] is True when the moving area is > 60% of the frame
+      or the mean brightness jumped > 25 (shake / lighting change).
+
+    Live mode and training both call this with person_box_cache=None,
+    run_person_detector=False (HOG is off; it never fired on the training data).
+    crop_state is only read/written when SMOOTH_CROP is enabled.
     """
     h, w = frame_bgr.shape[:2]
     frame_area = float(h * w)
@@ -137,7 +196,7 @@ def prepare_for_model(
             person = detected
         # if detector finds nothing, keep previous cache briefly (caller may clear)
 
-    motion, gray = _detect_motion_box(frame_bgr, prev_gray)
+    motion, gray, motion_frac, brightness_jump = _detect_motion_box(frame_bgr, prev_gray)
 
     box = None
     method = "full_frame"
@@ -157,7 +216,11 @@ def prepare_for_model(
         bw = min(w - x, bw + 2 * pad)
         bh = min(h - y, bh + 2 * pad)
         subject_frac = (bw * bh) / frame_area
-        crop = _square_crop(frame_bgr, x, y, bw, bh)
+        if SMOOTH_CROP and crop_state is not None:
+            x0, y0, side = _smooth_rect(frame_bgr, _square_rect(frame_bgr, x, y, bw, bh), crop_state)
+            crop = frame_bgr[y0 : y0 + side, x0 : x0 + side]
+        else:
+            crop = _square_crop(frame_bgr, x, y, bw, bh)
     else:
         # Mild center crop — still better than letterboxing empty edges sometimes
         side = int(min(h, w) * 0.7)
@@ -176,11 +239,16 @@ def prepare_for_model(
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
     meta = {
+        "person_box": person if method == "person_crop" else None,
         "input_width": w,
         "input_height": h,
         "method": method,
         "subject_area_frac": round(float(subject_frac), 4),
         "suitable_for_model": bool(suitable),
+        "global_motion": bool(
+            motion_frac > GLOBAL_MOTION_AREA_FRAC or brightness_jump > GLOBAL_BRIGHTNESS_JUMP
+        ),
+        "motion_area_frac": round(motion_frac, 4),
         "note": (
             "Subjects large enough for 112x112 analysis."
             if suitable
@@ -190,4 +258,4 @@ def prepare_for_model(
             )
         ),
     }
-    return rgb, meta, gray, person if method == "person_crop" else None
+    return rgb, meta, gray

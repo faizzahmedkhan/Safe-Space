@@ -1,1 +1,2 @@
-safespace_bullying_model.pth filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.command text eol=lf

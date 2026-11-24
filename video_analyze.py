@@ -1,194 +1,117 @@
-"""Offline video analysis using the same clip + smoothing logic as live mode."""
+"""Offline video analysis using exactly the live pipeline.
+
+Built on video_calibration.analyze_windows, which in turn uses inference_core
+(/255-only preprocessing, 15 fps timeline resampling, timestamp clip sampling,
+frame_prep with HOG off) and the shared IncidentTracker, so a verdict here
+means "live mode would have raised an incident on this footage".
+"""
 
 from __future__ import annotations
 
-from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import cv2
-import numpy as np
 import torch
-import torch.nn.functional as F
-import torchvision.transforms as T
 
-from camera import CLIP_LENGTH
-from frame_prep import prepare_for_model
-
-INFERENCE_STRIDE = 8
-SCORE_HISTORY_LEN = 10
-KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
-KINETICS_STD = [0.22803, 0.22145, 0.216989]
-
-_normalize = T.Normalize(mean=KINETICS_MEAN, std=KINETICS_STD)
-
-
-def _preprocess_clip(frames_rgb_112: List[np.ndarray], device: torch.device) -> torch.Tensor:
-    frames_array = np.stack(frames_rgb_112)
-    tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2).float()
-    tensor.div_(255.0)
-    tensor = _normalize(tensor)
-    tensor = tensor.permute(1, 0, 2, 3)
-    return tensor.unsqueeze(0).to(device)
+from inference_core import CAMERA_TARGET_FPS
+from video_calibration import analyze_windows
 
 
 def analyze_video_file(
     path: str,
     model: torch.nn.Module,
     device: torch.device,
-    alert_threshold: float = 0.60,
+    alert_threshold: Optional[float] = None,
     max_seconds: float = 180.0,
+    thresholds: Optional[Dict[str, Any]] = None,
+    model_version: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Run the violence model over a recorded video.
-    Uses the same subject-crop framing as live mode.
-    """
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
-    if fps <= 1e-3:
-        fps = 15.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    max_frames = int(max_seconds * fps) if max_seconds > 0 else 0
-
-    clip: Deque[np.ndarray] = deque(maxlen=CLIP_LENGTH)
-    score_history: Deque[float] = deque(maxlen=SCORE_HISTORY_LEN)
-    samples: List[Dict[str, Any]] = []
-    would_alert = False
-    alert_active = False
-    peak_raw = 0.0
-    peak_smoothed = 0.0
-    frames_seen = 0
-    since_infer = 0
-    prev_gray = None
-    person_box = None
-    suitable_count = 0
-    unsuitable_count = 0
-    last_meta: Dict[str, Any] = {}
-
-    model.eval()
-    with torch.no_grad():
-        while True:
-            if max_frames and frames_seen >= max_frames:
-                break
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames_seen += 1
-            since_infer += 1
-
-            rgb, meta, prev_gray, person_box = prepare_for_model(
-                frame,
-                prev_gray,
-                person_box_cache=person_box,
-                run_person_detector=(frames_seen % 10 == 1),
-            )
-            last_meta = meta
-            if meta.get("suitable_for_model"):
-                suitable_count += 1
-            else:
-                unsuitable_count += 1
-            clip.append(rgb)
-
-            if len(clip) < CLIP_LENGTH:
-                continue
-            if since_infer < INFERENCE_STRIDE:
-                continue
-            since_infer = 0
-
-            inputs = _preprocess_clip(list(clip), device)
-            outputs = model(inputs)
-            probs = F.softmax(outputs, dim=1)
-            raw = float(probs[0][1].item())
-            score_history.append(raw)
-
-            smoothed = None
-            # Start smoothing from the very first prediction. Short evidence
-            # clips (3-4 s) yield only ~5-6 predictions; waiting for 3 before
-            # computing a smoothed score means the highest-scoring frames
-            # (which come first in a fight clip) are skipped entirely.
-            if len(score_history) >= 1:
-                smoothed = float(sum(score_history) / len(score_history))
-                peak_smoothed = max(peak_smoothed, smoothed)
-                # Only count alerts when framing is suitable
-                if smoothed >= alert_threshold and meta.get("suitable_for_model"):
-                    if not alert_active:
-                        would_alert = True
-                        alert_active = True
-                else:
-                    alert_active = False
-
-            # High-confidence single-frame override: if the model is very
-            # confident on a single prediction (raw >= 75%), treat it as
-            # alertable even if the smoothed average hasn't caught up yet.
-            # This mirrors live mode where such a spike would push an
-            # already-warm score_history above threshold.
-            INSTANT_ALERT_THRESHOLD = 0.75
-            if raw >= INSTANT_ALERT_THRESHOLD and meta.get("suitable_for_model"):
-                if not alert_active:
-                    would_alert = True
-                    alert_active = True
-
-            peak_raw = max(peak_raw, raw)
-            t_sec = round(frames_seen / fps, 2)
-            samples.append(
-                {
-                    "t_sec": t_sec,
-                    "frame": frames_seen,
-                    "raw_pct": round(raw * 100, 1),
-                    "smoothed_pct": round(smoothed * 100, 1) if smoothed is not None else None,
-                    "above_threshold": bool(
-                        smoothed is not None and smoothed >= alert_threshold
-                    ),
-                    "suitable_for_model": bool(meta.get("suitable_for_model")),
-                    "subject_area_frac": meta.get("subject_area_frac"),
-                    "method": meta.get("method"),
-                }
-            )
-
-    cap.release()
-
-    if not samples:
+    res = analyze_windows(
+        path,
+        model,
+        device,
+        target_fps=CAMERA_TARGET_FPS,
+        thresholds=thresholds,
+        alert_threshold=alert_threshold,
+        max_seconds=max_seconds,
+    )
+    if not res["samples"]:
         raise RuntimeError(
-            "Video too short or unreadable — need enough frames for one 16-frame clip."
+            "Video too short or unreadable - need enough frames for one 16-frame clip."
         )
 
-    framing_ok_ratio = suitable_count / max(1, suitable_count + unsuitable_count)
-    verdict = "would_alert" if would_alert else "safe"
+    thr = res["alert_threshold"]
+    incidents = res["incidents"]
+    would_alert = bool(incidents)
+    n_kept = max(1, res["suitable_count"] + res["unsuitable_count"])
+    framing_ok_ratio = res["suitable_count"] / n_kept
+    peak_smoothed = res["peak_smoothed"]
+
+    samples = []
+    for s in res["samples"]:
+        meta = s["meta"]
+        samples.append(
+            {
+                "t_sec": round(s["t"], 2),
+                "frame": s["frame"],
+                "raw_pct": round(s["raw"] * 100, 1),
+                "smoothed_pct": round(s["smoothed"] * 100, 1),
+                "above_threshold": bool(s["smoothed"] >= thr),
+                "suitable_for_model": bool(s["suitable"]),
+                "subject_area_frac": meta.get("subject_area_frac"),
+                "method": meta.get("method"),
+                "global_motion": s["global_motion"],
+                "in_incident": s["in_incident"],
+            }
+        )
+
     if framing_ok_ratio < 0.25 and not would_alert:
         explanation = (
-            f"Most of this video is overview CCTV (subjects too small for 112×112). "
-            f"Peak smoothed {peak_smoothed*100:.1f}% — high scores here are unreliable. "
+            f"Most of this video is overview CCTV (subjects too small for 112x112). "
+            f"Peak smoothed {peak_smoothed*100:.1f}% - high scores here are unreliable. "
             f"Native resolution does not matter; camera distance/framing does. "
             f"Use a nearer view or fine-tune with labeled data."
         )
     elif would_alert:
+        first = incidents[0]
         explanation = (
-            f"Model would raise an alert (smoothed score reached {peak_smoothed*100:.1f}% "
-            f"≥ threshold {alert_threshold*100:.0f}%) on frames with suitable subject scale."
+            f"Model would raise {len(incidents)} incident(s) (first: {first['trigger']} at "
+            f"{first['start_t']:.1f}s, peak raw {max(i['peak'] for i in incidents)*100:.1f}%, "
+            f"threshold {thr*100:.0f}%), judged with the same preprocessing, 15 fps "
+            f"resampling, thresholds and incident rules as live mode."
         )
     else:
         explanation = (
-            f"Model stayed below alert threshold (or scores were suppressed due to "
-            f"unsuitable framing). Peak smoothed {peak_smoothed*100:.1f}% "
-            f"(threshold {alert_threshold*100:.0f}%)."
+            f"Model stayed below the incident rules (or scores were suppressed due to "
+            f"unsuitable framing / global motion). Peak smoothed {peak_smoothed*100:.1f}% "
+            f"(threshold {thr*100:.0f}%)."
         )
 
     return {
         "ok": True,
         "path": path,
-        "verdict": verdict,
+        "verdict": "would_alert" if would_alert else "safe",
         "would_alert": would_alert,
-        "peak_raw_pct": round(peak_raw * 100, 1),
+        "peak_raw_pct": round(res["peak_raw"] * 100, 1),
         "peak_smoothed_pct": round(peak_smoothed * 100, 1),
-        "alert_threshold_pct": round(alert_threshold * 100, 1),
-        "fps": round(fps, 2),
-        "frames_analyzed": frames_seen,
-        "total_frames": total_frames or frames_seen,
-        "duration_sec": round(frames_seen / fps, 2),
+        "alert_threshold_pct": round(thr * 100, 1),
+        "fps": round(res["native_fps"], 2),
+        "frames_analyzed": res["frames_read"],
+        "total_frames": res["total_frames"] or res["frames_read"],
+        "duration_sec": round(res["duration_sec"], 2),
         "framing_suitable_ratio": round(framing_ok_ratio, 3),
-        "scene": last_meta,
+        "global_motion_ratio": round(res["global_motion_count"] / n_kept, 3),
+        "scene": res["last_meta"],
         "samples": samples,
+        "incidents": [
+            {
+                "start_sec": round(i["start_t"], 2),
+                "end_sec": round(i["end_t"], 2),
+                "peak_pct": round(i["peak"] * 100, 1),
+                "trigger": i["trigger"],
+                "n_triggers": i["n_triggers"],
+            }
+            for i in incidents
+        ],
+        "model_version": model_version,
         "explanation": explanation,
     }

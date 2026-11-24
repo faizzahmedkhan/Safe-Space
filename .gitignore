@@ -1,5 +1,6 @@
 evidence/
 uploads/
+logs/
 calibration_out/
 *.web.mp4
 context.md
@@ -28,10 +29,3 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Frontend Dependencies & Builds
-frontend/node_modules/
-frontend/.next/
-frontend/.env.local
-frontend/out/
-

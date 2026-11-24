@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -17,7 +18,10 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 BRIDGE_COMMAND = os.path.join(ROOT, "start_lan_bridge.command")
 
 
-def bridge_shot_url() -> str:
+def bridge_shot_url(camera_id: Optional[str] = None) -> str:
+    """Per-camera frame URL (E6).  Without a camera_id: the legacy single endpoint."""
+    if camera_id:
+        return f"{BRIDGE_BASE}/shot/{camera_id}.jpg"
     return f"{BRIDGE_BASE}/shot.jpg"
 
 
@@ -29,8 +33,11 @@ def bridge_health() -> Optional[dict]:
         return None
 
 
-def _configure_upstream(upstream: str) -> Tuple[bool, str]:
-    payload = json.dumps({"upstream": upstream.rstrip("/")}).encode()
+def _configure_upstream(upstream: str, camera_id: Optional[str] = None) -> Tuple[bool, str]:
+    body = {"upstream": upstream.rstrip("/")}
+    if camera_id:
+        body["camera_id"] = camera_id
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{BRIDGE_BASE}/config",
         data=payload,
@@ -52,6 +59,13 @@ def _configure_upstream(upstream: str) -> Tuple[bool, str]:
 
 def _launch_bridge_via_terminal() -> None:
     """Start bridge in Terminal.app so it inherits Local Network permission."""
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            "The LAN bridge helper only auto-starts on macOS (it uses Terminal.app for Local "
+            "Network permission). On this OS start it yourself: `python lan_bridge.py` in a "
+            "separate terminal, then Connect again. (Usually unnecessary: direct phone access "
+            "works outside macOS.)"
+        )
     if not os.path.exists(BRIDGE_COMMAND):
         raise RuntimeError(f"Missing {BRIDGE_COMMAND}")
     # Ensure executable
@@ -66,9 +80,12 @@ def _launch_bridge_via_terminal() -> None:
     )
 
 
-def ensure_lan_bridge(upstream: str, wait_seconds: float = 20.0) -> Tuple[str, str]:
+def ensure_lan_bridge(
+    upstream: str, wait_seconds: float = 20.0, camera_id: Optional[str] = None
+) -> Tuple[str, str]:
     """
-    Make sure the LAN bridge is up and pointed at the phone.
+    Make sure the LAN bridge is up and pointed at the phone.  With camera_id the
+    upstream is registered for that camera only, so two phones never share a feed.
     Returns (local_shot_url, note).
     """
     upstream = upstream.rstrip("/")
@@ -87,7 +104,7 @@ def ensure_lan_bridge(upstream: str, wait_seconds: float = 20.0) -> Tuple[str, s
                 "keep the 'lan_bridge' Terminal window open, then try Connect again."
             )
 
-    ok, detail = _configure_upstream(upstream)
+    ok, detail = _configure_upstream(upstream, camera_id)
     if not ok:
         raise RuntimeError(
             f"LAN bridge could not reach the phone ({detail}). "
@@ -96,7 +113,7 @@ def ensure_lan_bridge(upstream: str, wait_seconds: float = 20.0) -> Tuple[str, s
 
     # Verify Cursor can pull a frame via localhost
     try:
-        with urllib.request.urlopen(bridge_shot_url(), timeout=8) as resp:
+        with urllib.request.urlopen(bridge_shot_url(camera_id), timeout=8) as resp:
             data = resp.read(1024)
             if not data:
                 raise RuntimeError("Bridge returned an empty frame")
@@ -107,4 +124,4 @@ def ensure_lan_bridge(upstream: str, wait_seconds: float = 20.0) -> Tuple[str, s
         "Using LAN bridge (Terminal.app) so Cursor can access the phone camera. "
         "Keep the bridge Terminal window open."
     )
-    return bridge_shot_url(), note
+    return bridge_shot_url(camera_id), note
