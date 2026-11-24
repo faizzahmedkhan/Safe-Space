@@ -32,6 +32,15 @@ The backend picks the model like this:
 At boot it logs the file's SHA-256 (first 12 chars) and every alert is stamped with
 `model_version` (`<file stem>@<sha12>`).
 
+**Preprocessing contract:** the sidecar's `"preprocessing"` key says how the model expects
+its input to be prepared (`preprocessing.py`): `crop` = `frame` (each frame cropped on its
+own) or `clip` (one crop box per 16-frame clip), and `normalize` = `none` (/255) or
+`kinetics` (/255 + Kinetics-400 mean/std). Presets: `"v1"` = frame + none, which is what
+every model without the key gets (all weights trained before this change), and `"v2"` = clip +
+kinetics. The live cameras, `/analyze/*`, `video_calibration.py` and training all follow
+it. The boot log and `GET /` show the active contract. An invalid value stops the backend
+at startup instead of feeding the model the wrong input.
+
 **Thresholds sidecar:** if `<model_stem>.json` exists next to the weights it can carry the
 thresholds tuned for that model (any of `alert_threshold`, `spike_threshold`,
 `score_history_len`, `alert_cooldown_seconds`, `post_roll_seconds`,
@@ -189,14 +198,18 @@ frame preparation as live mode. It **never overwrites** weights: it writes
 validation report of the chosen epoch).
 
 Useful options: `--epochs`, `--windows-per-video` (random training windows per video per
-epoch), `--selection-metric`, `--cache-dir`, `--cache-format npy|jpg`, `--cache-workers`.
+epoch), `--selection-metric`, `--preprocessing inherit|v1|v2` (default: keep the base
+model's contract), `--cache-dir`, `--cache-format auto|npy|jpg`, `--cache-workers`.
+Switching contracts (e.g. fine-tuning a v1 model with `--preprocessing v2`) changes the
+input distribution: train longer and recalibrate thresholds.
 
 **Frame cache.** Every video is prepared once (15 fps resampling + `frame_prep`, exactly
 as `/analyze/video` does) and stored in `.frame_cache/`; training and validation then read
 16-frame windows from it instead of re-decoding videos every epoch. Windows from the cache
 are bit-identical to on-the-fly preparation (`npy` format; `jpg` is ~10-25x smaller but
-lossy). Entries are keyed by video content plus a fingerprint of the frame code, so
-editing `frame_prep.py` never serves stale frames. The folder is safe to delete.
+lossy; `auto` picks npy for per-frame crops and jpg for clip crops, whose working frames
+are larger). Entries are keyed by video content, crop mode and a fingerprint of the frame
+code, so editing `frame_prep.py` never serves stale frames. The folder is safe to delete.
 
 **Best-epoch selection.** Validation scores every clip the way live mode does
 (`clip_eval.py`): a window every 8 frames over the whole clip, replayed through
@@ -206,8 +219,12 @@ best `--selection-metric` (default `pr_auc_max`, threshold-free) is kept.
 
 The Colab notebook (`SafeSpace_Weaponized (1).ipynb`) uses the same modules; upload
 `thresholds.py clip_sampler.py incident.py frame_prep.py prepared_frames.py frame_cache.py
-clip_eval.py inference_core.py cached_dataset.py` next to it. Its final-report cell
-evaluates on validation until you set `RUN_FINAL_TEST = True`; score the test split once.
+clip_eval.py inference_core.py cached_dataset.py preprocessing.py` next to it. Choose the
+contract with `PREPROCESSING` (default `PREPROC_V2`) and `FREEZE_FROZEN_BN`; `PREPROC_V1` +
+`False` reproduces the original pipeline. The save cell downloads the `.pth` **and its
+`.json` sidecar**: copy both into the project folder, or the backend will treat the model as
+v1. Its final-report cell evaluates on validation until you set `RUN_FINAL_TEST = True`;
+score the test split once.
 
 3. Restart the backend with the new weights, then re-run `video_calibration.py` on some
    footage and adjust the sidecar thresholds if needed:

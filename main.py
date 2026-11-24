@@ -100,8 +100,9 @@ RETENTION_INTERVAL_S = 3600.0
 MAX_UPLOAD_BYTES = int(float(os.environ.get("SAFESPACE_MAX_UPLOAD_MB", "500")) * 1024 * 1024)
 MAX_YT_DURATION_S = 15 * 60
 
-# NOTE: the training notebook only ever does `vframes / 255.0` - it never
-# applies Kinetics mean/std normalization (see inference_core.preprocess_clip).
+# NOTE: cropping and normalization follow the loaded model's preprocessing
+# contract (MODEL_INFO["preprocessing"], from its sidecar; legacy models =
+# per-frame crop, /255 only).  See preprocessing.py.
 
 ALERTS_FILE = "alerts.json"
 CAMERAS_CONFIG_FILE = "cameras_config.json"
@@ -175,9 +176,12 @@ THRESHOLDS = MODEL_INFO["thresholds"]
 ALERT_THRESHOLD = THRESHOLDS["alert_threshold"]
 SPIKE_THRESHOLD = THRESHOLDS["spike_threshold"]
 SCORE_HISTORY_LEN = int(THRESHOLDS["score_history_len"])
+PREPROC = MODEL_INFO["preprocessing"]
 add_log(
     f"Model {MODEL_VERSION} loaded on {device} (alert>={ALERT_THRESHOLD}, spike>={SPIKE_THRESHOLD}"
-    + (", thresholds from sidecar)" if MODEL_INFO["thresholds_from_sidecar"] else ", default thresholds)"),
+    + (", thresholds from sidecar)" if MODEL_INFO["thresholds_from_sidecar"] else ", default thresholds)")
+    + f"; preprocessing {PREPROC.name} (crop={PREPROC.crop}, normalize={PREPROC.normalize}, "
+    f"from {MODEL_INFO['preprocessing_source']})",
     kind="system",
 )
 if not AUTH_ENABLED:
@@ -296,7 +300,8 @@ def _default_camera_config() -> dict:
 
 
 def _new_camera_slot(camera_id: str, label: str = "") -> dict:
-    stream = CameraStream(src=None, target_fps=CAMERA_TARGET_FPS, show_preview=False, soft_fail=True)
+    stream = CameraStream(src=None, target_fps=CAMERA_TARGET_FPS, show_preview=False, soft_fail=True,
+                          crop_mode=PREPROC.crop)
     tracker = make_tracker(THRESHOLDS)
     stream.on_recording_finished = lambda path, ok, _cid=camera_id: _on_recording_finished(_cid, path, ok)
     return {
@@ -568,7 +573,7 @@ async def _watcher_cycle(stride_s: float) -> None:
 
         ready_ids.append(camera_id)
         ready_snaps.append(snap)
-        ready_tensors.append(preprocess_clip(snap["frames"]))
+        ready_tensors.append(preprocess_clip(snap["frames"], normalize=PREPROC.normalize))
 
     if not ready_tensors:
         return
@@ -1008,6 +1013,7 @@ def read_root():
         "cameras_active": sum(1 for s in cameras.values() if s["stream"].is_active()),
         "watcher_last_cycle_age_ms": _watcher_age_ms(),
         "model_version": MODEL_VERSION,
+        "preprocessing": PREPROC.name,
         "auth_enabled": AUTH_ENABLED,
     }
 

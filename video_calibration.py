@@ -57,7 +57,8 @@ from inference_core import (
     preprocess_clip,
 )
 
-from prepared_frames import PreparedFrameReader
+import preprocessing
+from prepared_frames import PreparedFrameReader, clip_from_items, window_item
 
 log = logging.getLogger("safespace.calibration")
 
@@ -66,8 +67,10 @@ log = logging.getLogger("safespace.calibration")
 
 
 def score_window(model: nn.Module, frames_rgb_112: List[np.ndarray], device: torch.device) -> float:
-    """Same tensor prep as live mode (inference_core.preprocess_clip: /255 only)."""
-    batch = preprocess_clip(frames_rgb_112).unsqueeze(0).to(device)
+    """Same tensor prep as live mode (inference_core.preprocess_clip with the
+    normalization recorded in the model's preprocessing contract)."""
+    normalize = preprocessing.of_model(model).normalize
+    batch = preprocess_clip(frames_rgb_112, normalize=normalize).unsqueeze(0).to(device)
     return float(predict_violence(model, batch)[0].item())
 
 
@@ -82,10 +85,16 @@ def analyze_windows(
     history_len: Optional[int] = None,
     max_seconds: float = 0.0,
 ) -> Dict[str, Any]:
-    """Run a video through exactly the live pipeline: frame_prep (HOG off) ->
-    15 fps timeline resample -> timestamp clip sampling -> /255 -> model ->
-    IncidentTracker.  Returns raw per-window samples plus incident records."""
-    reader = PreparedFrameReader(path, target_fps=target_fps, max_seconds=max_seconds)
+    """Run a video through exactly the live pipeline: 15 fps timeline
+    resample -> frame_prep per the model's crop mode (HOG off) -> timestamp
+    clip sampling -> clip assembly -> tensor (model's normalization) -> model
+    -> IncidentTracker.  Returns raw per-window samples plus incident records.
+    The preprocessing contract comes from the model (inference_core.load_model
+    attaches it from the sidecar)."""
+    spec = preprocessing.of_model(model)
+    reader = PreparedFrameReader(
+        path, target_fps=target_fps, max_seconds=max_seconds, crop_mode=spec.crop
+    )
     stride_s = INFERENCE_STRIDE / float(target_fps)
 
     window = ClipWindow(n=CLIP_LENGTH, fps=target_fps)
@@ -136,7 +145,7 @@ def analyze_windows(
             unsuitable_count += 1
         if pf.global_motion:
             global_count += 1
-        if window.add(t, pf.rgb, pf.suitable, pf.global_motion):
+        if window.add(t, window_item(pf), pf.suitable, pf.global_motion):
             handle(tracker.reset(t, reason="gap"))
             last_scored = None
 
@@ -147,7 +156,7 @@ def analyze_windows(
             continue
         last_scored = t
 
-        raw = score_window(model, sample["items"], device)
+        raw = score_window(model, clip_from_items(sample["items"], spec.crop), device)
         events = tracker.update(
             t, raw, suitable=sample["suitable"], degraded=False,
             global_motion=sample["global_motion"],
@@ -177,6 +186,7 @@ def analyze_windows(
             inc["end_t"] = last_t
 
     return {
+        "preprocessing": spec.name,
         "native_fps": reader.native_fps,
         "total_frames": reader.total_frames,
         "frames_read": reader.frames_read,

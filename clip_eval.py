@@ -304,13 +304,18 @@ def score_videos(
 
     videos: iterable of (path, label, class_name, CachedVideo); a generator
     that loads each CachedVideo lazily keeps memory flat.  Windows from
-    several videos share forward passes.  Leaves the model in eval() mode:
+    several videos share forward passes.  Cropping and normalization follow
+    the model's preprocessing contract (preprocessing.of_model); a video
+    cached with another crop mode is an error, not a silent mismatch.
+    Leaves the model in eval() mode:
     the caller restores its own train mode (train.py keeps frozen BatchNorm
     in eval, so a blanket model.train() here would be wrong)."""
     import torch  # noqa: F401  (lazy: metric code above stays torch-free)
 
+    import preprocessing
     from inference_core import predict_violence, preprocess_batch
 
+    spec = preprocessing.of_model(model)
     model.eval()
     results: List[VideoScores] = []
     pending: List[Tuple[int, int, np.ndarray]] = []  # (video_idx, window_idx, frames)
@@ -319,13 +324,19 @@ def score_videos(
     def flush() -> None:
         if not pending:
             return
-        batch = preprocess_batch(np.stack([p[2] for p in pending])).to(device)
+        batch = preprocess_batch(np.stack([p[2] for p in pending]), normalize=spec.normalize).to(device)
         probs = predict_violence(model, batch).numpy()
         for (vi, wi, _), pr in zip(pending, probs):
             raw_store[vi][wi] = pr
         pending.clear()
 
     for path, label, cls, video in videos:
+        if video.crop_mode != spec.crop:
+            raise ValueError(
+                f"{path} was cached with crop_mode={video.crop_mode!r} but the model's "
+                f"preprocessing is {spec.name} (crop={spec.crop!r}); use a FrameCache with "
+                f"crop_mode={spec.crop!r}"
+            )
         windows = video.schedule()
         short = not windows
         if short:

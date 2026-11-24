@@ -4,9 +4,12 @@ Everything that scores video (live watcher in main.py, /analyze/*,
 video_calibration.py, train.py) goes through this module so the model always
 sees the same input the training pipeline produced:
 
-  * frames from frame_prep.prepare_for_model (HOG off, no person-box cache)
+  * frames prepared per the model's preprocessing contract (preprocessing.py:
+    crop "frame" = frame_prep.prepare_for_model, crop "clip" =
+    frame_prep.observe_frame + build_clip; HOG off, no person-box cache)
   * sampled on a 15 fps timeline (clip_sampler)
-  * scaled by /255 ONLY (no Kinetics mean/std), layout (C, T, H, W)
+  * scaled by /255, plus Kinetics mean/std when the contract says
+    normalize="kinetics" (legacy models: /255 only), layout (C, T, H, W)
   * decisions made by incident.IncidentTracker with the thresholds below
     (or the ones stored in the model's JSON sidecar)
 """
@@ -27,7 +30,9 @@ import torch.nn.functional as F
 import torchvision.models.video as video_models
 
 from clip_sampler import ClipWindow, FpsResampler, select_clip_indices  # noqa: F401
+import preprocessing
 from incident import IncidentTracker, default_thresholds, make_tracker  # noqa: F401  (re-exported)
+from preprocessing import KINETICS_MEAN, KINETICS_STD, PreprocSpec
 from thresholds import (  # noqa: F401  (re-exported)
     ALERT_COOLDOWN_SECONDS,
     ALERT_THRESHOLD,
@@ -62,18 +67,26 @@ FORWARD_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- preprocessing
-def preprocess_clip(frames_rgb_112: List[np.ndarray]) -> torch.Tensor:
-    """List of T uint8 RGB frames (H, W, 3) -> float tensor (C, T, H, W) in
-    [0, 1].  /255 only: the training notebook never applies Kinetics
-    mean/std, so doing so here would silently put every prediction
-    out-of-distribution."""
-    return preprocess_batch(np.stack(frames_rgb_112)[None])[0]
+def preprocess_clip(frames_rgb_112: List[np.ndarray], normalize: str = "none") -> torch.Tensor:
+    """T uint8 RGB frames (H, W, 3) -> float tensor (C, T, H, W).
+
+    normalize must match how the model was trained (its preprocessing
+    contract, preprocessing.of_model(model).normalize): "none" = /255 only
+    (every legacy model), "kinetics" = /255 then Kinetics-400 mean/std.  The
+    wrong choice silently puts every prediction out-of-distribution."""
+    return preprocess_batch(np.stack(frames_rgb_112)[None], normalize=normalize)[0]
 
 
-def preprocess_batch(clips_uint8: np.ndarray) -> torch.Tensor:
-    """(B, T, H, W, 3) uint8 RGB clips -> float tensor (B, C, T, H, W) in
-    [0, 1].  The one implementation behind preprocess_clip, the training
-    datasets and batched evaluation (clip_eval), so they cannot drift."""
+_KINETICS_MEAN = torch.tensor(KINETICS_MEAN, dtype=torch.float32).view(1, 3, 1, 1, 1)
+_KINETICS_STD = torch.tensor(KINETICS_STD, dtype=torch.float32).view(1, 3, 1, 1, 1)
+
+
+def preprocess_batch(clips_uint8: np.ndarray, normalize: str = "none") -> torch.Tensor:
+    """(B, T, H, W, 3) uint8 RGB clips -> float tensor (B, C, T, H, W).
+    The one implementation behind preprocess_clip, the training datasets and
+    batched evaluation (clip_eval), so they cannot drift."""
+    if normalize not in preprocessing.NORMALIZE_MODES:
+        raise ValueError(f"normalize must be one of {preprocessing.NORMALIZE_MODES}, got {normalize!r}")
     arr = np.ascontiguousarray(clips_uint8)  # flipped / memmap views are fine
     if not arr.flags.writeable:  # torch.from_numpy warns on read-only memory
         arr = arr.copy()
@@ -81,7 +94,10 @@ def preprocess_batch(clips_uint8: np.ndarray) -> torch.Tensor:
         raise ValueError(f"expected (B, T, H, W, 3) clips, got shape {arr.shape}")
     tensor = torch.from_numpy(arr).float()  # (B, T, H, W, C)
     tensor.div_(255.0)
-    return tensor.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, T, H, W)
+    out = tensor.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, T, H, W)
+    if normalize == "kinetics":
+        out.sub_(_KINETICS_MEAN).div_(_KINETICS_STD)
+    return out
 
 
 def predict_violence(model: nn.Module, batch: torch.Tensor) -> torch.Tensor:
@@ -124,6 +140,29 @@ def file_sha256_12(path: str) -> str:
     return h.hexdigest()[:12]
 
 
+def _read_sidecar_json(path: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    sidecar = os.path.splitext(path)[0] + ".json"
+    if not os.path.isfile(sidecar):
+        return None, None
+    with open(sidecar, "r") as f:
+        data = json.load(f)
+    return (data if isinstance(data, dict) else None), sidecar
+
+
+def _resolve_preprocessing(sidecar: Optional[Dict[str, Any]], checkpoint: Any) -> Tuple[PreprocSpec, str]:
+    """The model's input contract: sidecar "preprocessing", else the full
+    checkpoint's config["preprocessing"], else legacy (v1).  A present but
+    invalid value raises: running a model on the wrong input must fail at
+    boot, not silently degrade every score."""
+    if sidecar is not None and sidecar.get("preprocessing") is not None:
+        return preprocessing.parse_preprocessing(sidecar["preprocessing"]), "sidecar"
+    if isinstance(checkpoint, dict):
+        cfg = checkpoint.get("config")
+        if isinstance(cfg, dict) and cfg.get("preprocessing") is not None:
+            return preprocessing.parse_preprocessing(cfg["preprocessing"]), "checkpoint"
+    return preprocessing.LEGACY_PREPROC, "legacy default"
+
+
 def _load_sidecar(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
     sidecar = os.path.splitext(path)[0] + ".json"
     if not os.path.isfile(sidecar):
@@ -160,7 +199,8 @@ def load_model(
         )
     sha = file_sha256_12(resolved)
     model = build_model()
-    state = torch.load(resolved, map_location=device, weights_only=True)
+    checkpoint = torch.load(resolved, map_location=device, weights_only=True)
+    state = checkpoint
     if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
         state = state["state_dict"]
     model.load_state_dict(state)
@@ -169,6 +209,12 @@ def load_model(
 
     sidecar_vals, sidecar_path = _load_sidecar(resolved)
     thresholds = {**default_thresholds(), **sidecar_vals}
+    try:
+        sidecar_data, _ = _read_sidecar_json(resolved)
+    except Exception:  # unreadable JSON is already reported by _load_sidecar
+        sidecar_data = None
+    spec, spec_source = _resolve_preprocessing(sidecar_data, checkpoint)
+    preprocessing.attach(model, spec)
     stem = os.path.splitext(os.path.basename(resolved))[0]
     info = {
         "path": resolved,
@@ -178,11 +224,14 @@ def load_model(
         "sidecar": sidecar_path,
         "thresholds": thresholds,
         "thresholds_from_sidecar": bool(sidecar_vals),
+        "preprocessing": spec,
+        "preprocessing_source": spec_source,
         "device": str(device),
     }
     log.info(
-        "Loaded model %s sha256=%s on %s (thresholds %s)",
+        "Loaded model %s sha256=%s on %s (thresholds %s, preprocessing %s from %s)",
         resolved, sha, device,
         "from sidecar " + str(sidecar_path) if sidecar_vals else "default",
+        spec.name, spec_source,
     )
     return model, info

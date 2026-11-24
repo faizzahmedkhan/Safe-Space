@@ -12,8 +12,10 @@ from collections import deque
 from datetime import datetime
 from typing import Callable, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
-from frame_prep import prepare_for_model
+from frame_prep import observe_frame, prepare_for_model
 from clip_sampler import ClipWindow, detect_gap
+from prepared_frames import clip_from_items
+from preprocessing import CROP_MODES
 from thresholds import (
   CAMERA_TARGET_FPS,
   CLIP_LENGTH,
@@ -463,19 +465,27 @@ def _clamp(v, lo, hi):
 
 
 class CameraStream:
-  def __init__(self, src=0, target_fps=CAMERA_TARGET_FPS, show_preview=True, soft_fail=True):
+  def __init__(self, src=0, target_fps=CAMERA_TARGET_FPS, show_preview=True, soft_fail=True,
+               crop_mode="frame"):
     """
     src=0 opens the default laptop webcam.
     src="http://..." opens a network camera stream (HTTP IP Webcam preferred).
     soft_fail=True: failed open leaves camera inactive instead of raising.
+    crop_mode: the loaded model's preprocessing crop mode ("frame" or "clip",
+    see preprocessing.py); main.py passes MODEL_INFO["preprocessing"].crop.
     """
+    if crop_mode not in CROP_MODES:
+      raise ValueError(f"crop_mode must be one of {CROP_MODES}, got {crop_mode!r}")
+    self.crop_mode = crop_mode
     self.target_fps = target_fps
     self.show_preview = show_preview
     self.preview_enabled = show_preview
     self.soft_fail = soft_fail
 
-    # Timestamped inference window (A1).  Each entry is one prepared 112x112
-    # RGB frame with its real arrival time (time.monotonic()).
+    # Timestamped inference window (A1).  Each entry is one prepared frame
+    # with its real arrival time (time.monotonic()): the final 112x112 RGB
+    # crop (crop_mode "frame") or (working RGB frame, motion box) to be
+    # clip-cropped at snapshot time (crop_mode "clip").
     self.window = ClipWindow(n=CLIP_LENGTH, fps=CAMERA_TARGET_FPS)
     self.evidence_buffer = deque(maxlen=EVIDENCE_BUFFER_LEN)
     self.max_evidence_mb = 150
@@ -734,21 +744,13 @@ class CameraStream:
         self.evidence_buffer_initialized = True
         log.info("Evidence buffer capped at %d frames (%s MB)", max_frames, self.max_evidence_mb)
 
-      # B1: live matches training - HOG person detector OFF, no person-box
-      # cache (the old never-expiring cache pinned the crop to a stale spot).
-      frame_rgb, scene_meta, self._prev_gray = prepare_for_model(
-        frame,
-        self._prev_gray,
-        person_box_cache=None,
-        run_person_detector=False,
-        crop_state=self._crop_state,
-      )
+      item, scene_meta = self._prepare_frame(frame)
       self._update_frozen(frame, ts)
 
       with self._lock:
         self.window.add(
           ts,
-          frame_rgb,
+          item,
           suitable=scene_meta.get("suitable_for_model", True),
           global_motion=scene_meta.get("global_motion", False),
         )
@@ -792,11 +794,36 @@ class CameraStream:
       else:
         next_deadline = now
 
+  def _prepare_frame(self, frame):
+    """Per-frame half of the model's preprocessing (updates prev_gray).
+    Returns (window_item, scene_meta)."""
+    if self.crop_mode == "frame":
+      # B1: live matches training - HOG person detector OFF, no person-box
+      # cache (the old never-expiring cache pinned the crop to a stale spot).
+      frame_rgb, scene_meta, self._prev_gray = prepare_for_model(
+        frame,
+        self._prev_gray,
+        person_box_cache=None,
+        run_person_detector=False,
+        crop_state=self._crop_state,
+      )
+      return frame_rgb, scene_meta
+    working_rgb, scene_meta, self._prev_gray = observe_frame(frame, self._prev_gray)
+    return (working_rgb, scene_meta.get("motion_box")), scene_meta
+
+  def _clip_frames(self, items):
+    """Sampled window items -> the 16 model-ready 112x112 RGB frames."""
+    if self.crop_mode == "frame":
+      return items
+    return clip_from_items(items, "clip")
+
   # ---------------------------------------------------------------- queries
   def get_buffer(self):
-    """RGB frames of the latest clip window (<= CLIP_LENGTH, oldest first)."""
+    """Images of the latest clip window (<= CLIP_LENGTH, oldest first): 112x112
+    crops in crop_mode "frame", working frames in crop_mode "clip"."""
     with self._lock:
-      return list(self.window.items)[-CLIP_LENGTH:]
+      items = list(self.window.items)[-CLIP_LENGTH:]
+    return items if self.crop_mode == "frame" else [it[0] for it in items]
 
   def get_buffer_fill(self):
     with self._lock:
@@ -834,7 +861,7 @@ class CameraStream:
     }
     if sample is not None:
       snap.update(
-        frames=sample["items"],
+        frames=self._clip_frames(sample["items"]),  # clip crop runs outside the lock
         t_end=sample["t_end"],
         suitable=sample["suitable"],
         global_motion=sample["global_motion"],

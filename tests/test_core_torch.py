@@ -108,21 +108,92 @@ class CachedPipelineTorchTests(unittest.TestCase):
 
     def test_cached_scores_match_analyze_windows(self):
         import clip_eval
+        import preprocessing
         from frame_cache import FrameCache
         from video_calibration import analyze_windows
 
         dev = torch.device("cpu")
-        ref = analyze_windows(self.video, self.model, dev)
-        cache = FrameCache(os.path.join(self.tmp, "cache"))
-        res = clip_eval.evaluate_model(
-            self.model, [(self.video, 1, "Violence", cache.get(self.video))], dev, batch_size=3
-        )
-        vs = res.scores[0]
-        self.assertEqual(len(ref["samples"]), vs.n_windows)
-        for s, raw, t in zip(ref["samples"], vs.raw, vs.t_end):
-            self.assertAlmostEqual(s["t"], t, places=9)
-            self.assertAlmostEqual(s["raw"], float(raw), places=5)  # batched vs single forward
-        self.assertEqual(len(ref["incidents"]), res.rows[0]["n_incidents"])
+        for spec in (preprocessing.PREPROC_V1, preprocessing.PREPROC_V2):
+            with self.subTest(preprocessing=spec.name):
+                preprocessing.attach(self.model, spec)
+                ref = analyze_windows(self.video, self.model, dev)
+                self.assertEqual(ref["preprocessing"], spec.name)
+                cache = FrameCache(os.path.join(self.tmp, f"cache_{spec.name}"), fmt="npy",
+                                   crop_mode=spec.crop)
+                res = clip_eval.evaluate_model(
+                    self.model, [(self.video, 1, "Violence", cache.get(self.video))], dev, batch_size=3
+                )
+                vs = res.scores[0]
+                self.assertEqual(len(ref["samples"]), vs.n_windows)
+                for s, raw, t in zip(ref["samples"], vs.raw, vs.t_end):
+                    self.assertAlmostEqual(s["t"], t, places=9)
+                    self.assertAlmostEqual(s["raw"], float(raw), places=5)  # batched vs single forward
+                self.assertEqual(len(ref["incidents"]), res.rows[0]["n_incidents"])
+        preprocessing.attach(self.model, preprocessing.PREPROC_V1)
+
+    def test_eval_rejects_cache_with_other_crop_mode(self):
+        import clip_eval
+        import preprocessing
+        from frame_cache import FrameCache
+
+        cache = FrameCache(os.path.join(self.tmp, "cache_mismatch"), crop_mode="frame")
+        preprocessing.attach(self.model, preprocessing.PREPROC_V2)
+        try:
+            with self.assertRaises(ValueError):
+                clip_eval.evaluate_model(self.model, [(self.video, 1, "V", cache.get(self.video))],
+                                         torch.device("cpu"))
+        finally:
+            preprocessing.attach(self.model, preprocessing.PREPROC_V1)
+
+    def test_kinetics_normalization(self):
+        import preprocessing
+
+        clips = np.zeros((1, 16, 4, 4, 3), np.uint8)
+        clips[..., 0], clips[..., 1], clips[..., 2] = 255, 128, 0
+        x = core.preprocess_batch(clips, normalize="kinetics")
+        for c, v in enumerate((255, 128, 0)):
+            want = (v / 255.0 - preprocessing.KINETICS_MEAN[c]) / preprocessing.KINETICS_STD[c]
+            self.assertAlmostEqual(x[0, c, 0, 0, 0].item(), want, places=5)
+        self.assertTrue(torch.equal(core.preprocess_clip(list(clips[0]), normalize="kinetics"), x[0]))
+        with self.assertRaises(ValueError):
+            core.preprocess_batch(clips, normalize="imagenet")
+
+    def test_load_model_preprocessing_contract(self):
+        import preprocessing
+
+        state = self.model.state_dict()
+        d = os.path.join(self.tmp, "contract")
+        os.makedirs(d, exist_ok=True)
+        cpu = torch.device("cpu")
+
+        legacy = os.path.join(d, "legacy.pth")
+        torch.save(state, legacy)
+        m, info = core.load_model(legacy, cpu)
+        self.assertEqual(info["preprocessing"], preprocessing.PREPROC_V1)
+        self.assertEqual(info["preprocessing_source"], "legacy default")
+        self.assertEqual(preprocessing.of_model(m), preprocessing.PREPROC_V1)
+
+        side = os.path.join(d, "side.pth")
+        torch.save(state, side)
+        with open(os.path.join(d, "side.json"), "w") as f:
+            json.dump({"thresholds": {"alert_threshold": 0.7}, "preprocessing": "v2"}, f)
+        m, info = core.load_model(side, cpu)
+        self.assertEqual(preprocessing.of_model(m), preprocessing.PREPROC_V2)
+        self.assertEqual(info["preprocessing_source"], "sidecar")
+        self.assertEqual(info["thresholds"]["alert_threshold"], 0.7)
+
+        full = os.path.join(d, "full.pth")
+        torch.save({"state_dict": state, "config": {"preprocessing": {"crop": "clip", "normalize": "kinetics"}}}, full)
+        m, info = core.load_model(full, cpu)
+        self.assertEqual(info["preprocessing"], preprocessing.PREPROC_V2)
+        self.assertEqual(info["preprocessing_source"], "checkpoint")
+
+        bad = os.path.join(d, "bad.pth")
+        torch.save(state, bad)
+        with open(os.path.join(d, "bad.json"), "w") as f:
+            json.dump({"preprocessing": "v9"}, f)
+        with self.assertRaises(ValueError):
+            core.load_model(bad, cpu)
 
     def test_cached_dataset_items(self):
         import random
@@ -138,6 +209,17 @@ class CachedPipelineTorchTests(unittest.TestCase):
         random.seed(0)
         x, y = ds[2]
         self.assertEqual(tuple(x.shape), (3, 16, 112, 112))
+        import preprocessing
+
+        clip_cache = FrameCache(os.path.join(self.tmp, "ds_clip"), crop_mode="clip")
+        ckey, _ = clip_cache.ensure(self.video)
+        v2 = CachedClipDataset(clip_cache, [CacheItem(ckey, 1, self.video, "Violence")],
+                               preprocessing=preprocessing.PREPROC_V2)
+        x2, _ = v2[0]
+        self.assertEqual(tuple(x2.shape), (3, 16, 112, 112))
+        self.assertLess(float(x2.min()), 0.0)  # normalized, not [0, 1]
+        with self.assertRaises(ValueError):  # cache crop mode must match the contract
+            CachedClipDataset(cache, [], preprocessing=preprocessing.PREPROC_V2)
         self.assertEqual(x.dtype, torch.float32)
         self.assertEqual(int(y), 1)
         self.assertLessEqual(float(x.max()), 1.0)
@@ -164,7 +246,7 @@ class CachedPipelineTorchTests(unittest.TestCase):
             "--data-dir", data, "--out-dir", out_dir, "--base-model", base,
             "--epochs", "1", "--batch-size", "2", "--windows-per-video", "1",
             "--val-frac", "0.25", "--cache-dir", os.path.join(self.tmp, "train_cache"),
-            "--cache-workers", "1",
+            "--cache-workers", "1", "--preprocessing", "v2",
         ])
         out = train.train(args)
         self.assertTrue(out and os.path.isfile(out))
@@ -173,6 +255,11 @@ class CachedPipelineTorchTests(unittest.TestCase):
         self.assertEqual(side["selection"]["metric"], "pr_auc_max")
         self.assertEqual(side["best_epoch"], 1)
         self.assertIn("live", side["selection"]["validation"])
+        self.assertEqual(side["preprocessing"], {"name": "v2", "crop": "clip", "normalize": "kinetics"})
+        import preprocessing
+
+        m, info = core.load_model(out, torch.device("cpu"))  # the backend picks the contract up
+        self.assertEqual(preprocessing.of_model(m), preprocessing.PREPROC_V2)
         shutil.rmtree(out_dir, ignore_errors=True)
 
 

@@ -3,11 +3,20 @@
 Matches the live pipeline exactly:
   * every video is prepared ONCE into the frame cache (frame_cache.py) by the
     same front-end /analyze/* uses (prepared_frames.PreparedFrameReader):
-    15 fps timeline resampling, frame_prep.prepare_for_model with HOG off and
-    no person-box cache.  A window cut from the cache is bit-identical to
-    preparing it on the fly, it is just not re-decoded every epoch.
-  * 16-frame windows sampled like ClipWindow.sample (clip_sampler)
-  * /255 scaling only (NO Kinetics mean/std) - inference_core.preprocess_batch
+    15 fps timeline resampling, then the per-frame half of the model's crop
+    mode with HOG off.  A window cut from the cache is identical to preparing
+    it on the fly, it is just not re-decoded every epoch.
+  * 16-frame windows sampled like ClipWindow.sample (clip_sampler), assembled
+    with the same clip crop the live camera uses
+  * tensor conversion with the contract's normalization
+    (inference_core.preprocess_batch)
+
+Preprocessing contract (preprocessing.py): by default the fine-tuned model
+keeps its base model's contract (legacy models: v1 = per-frame crop, /255).
+--preprocessing v2 switches to one crop per clip + Kinetics normalization;
+the new contract is written to the sidecar, so the backend feeds the model
+correctly.  Changing it changes the input distribution: train for more
+epochs and recalibrate thresholds afterwards.
 
 Training recipe: start from the currently selected model (load_model:
 SAFESPACE_MODEL or the auto-picked file), freeze everything up to layer3, train
@@ -54,7 +63,8 @@ from clip_eval import (
     format_summary,
     selection_value,
 )
-from frame_cache import FORMATS, FrameCache
+import preprocessing
+from frame_cache import FORMAT_CHOICES, FrameCache
 from inference_core import load_model
 
 log = logging.getLogger("safespace.train")
@@ -172,7 +182,22 @@ def train(args: Optional[argparse.Namespace] = None) -> Optional[str]:
         return None
 
     train_split, val_split = split_videos(paths, labels, args.val_frac, args.seed)
-    cache = FrameCache(args.cache_dir, fmt=args.cache_format)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, base_info = load_model(args.base_model, device)
+    thresholds = base_info["thresholds"]
+    base_spec = base_info["preprocessing"]
+    spec = base_spec if args.preprocessing == "inherit" else preprocessing.parse_preprocessing(args.preprocessing)
+    preprocessing.attach(model, spec)
+    if spec != base_spec:
+        log.warning(
+            "Preprocessing changes from %s (base model) to %s: the input distribution changes, "
+            "so expect to need more epochs and to recalibrate thresholds.", base_spec.name, spec.name,
+        )
+    log.info("Preprocessing: %s (crop=%s, normalize=%s)", spec.name, spec.crop, spec.normalize)
+    frozen = freeze_for_finetune(model)
+
+    cache = FrameCache(args.cache_dir, fmt=args.cache_format, crop_mode=spec.crop)
     train_items = build_cache_items(cache, train_split, args.cache_workers)
     val_items = build_cache_items(cache, val_split, args.cache_workers)
     log.info("Train videos: %d, validation videos: %d", len(train_items), len(val_items))
@@ -180,12 +205,8 @@ def train(args: Optional[argparse.Namespace] = None) -> Optional[str]:
         log.error("After caching, the training split no longer has both classes.")
         return None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, base_info = load_model(args.base_model, device)
-    thresholds = base_info["thresholds"]
-    frozen = freeze_for_finetune(model)
-
-    train_ds = CachedClipDataset(cache, train_items, windows_per_video=args.windows_per_video)
+    train_ds = CachedClipDataset(cache, train_items, windows_per_video=args.windows_per_video,
+                                 preprocessing=spec)
     gen = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_ds,
@@ -260,6 +281,7 @@ def train(args: Optional[argparse.Namespace] = None) -> Optional[str]:
     torch.save(model.state_dict(), out_path)
     sidecar = {
         "thresholds": thresholds,
+        "preprocessing": preprocessing.sidecar_value(spec),
         "base_model": base_info["version"],
         "trained_at": datetime.now().isoformat(timespec="seconds"),
         "seed": args.seed,
@@ -273,7 +295,7 @@ def train(args: Optional[argparse.Namespace] = None) -> Optional[str]:
             "value": best_value if best_state is not None else None,
             "validation": best_summary,
         },
-        "frame_cache": {"format": cache.fmt, "fingerprint": cache.fingerprint},
+        "frame_cache": {"format": cache.fmt, "crop_mode": cache.crop_mode, "fingerprint": cache.fingerprint},
         "history": history,
         "note": "Thresholds were inherited from the base model; re-run video_calibration.py and edit them here if needed.",
     }
@@ -295,8 +317,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-dir", default=CACHE_DIR, help="Frame cache directory (safe to delete).")
-    p.add_argument("--cache-format", choices=FORMATS, default="npy",
-                   help="npy = exact (default); jpg = ~10-25x smaller but lossy.")
+    p.add_argument("--preprocessing", choices=["inherit"] + sorted(preprocessing.PRESETS), default="inherit",
+                   help="Input contract: inherit the base model's (default), v1 or v2 (see preprocessing.py).")
+    p.add_argument("--cache-format", choices=FORMAT_CHOICES, default="auto",
+                   help="auto = npy for per-frame crops, jpg for clip crops; npy is exact, jpg is lossy but small.")
     p.add_argument("--cache-workers", type=int, default=max(1, min(4, (os.cpu_count() or 1) - 1)),
                    help="Processes used to build the frame cache.")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (cache reads are cheap).")

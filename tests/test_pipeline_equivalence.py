@@ -46,6 +46,7 @@ STUB_INFERENCE_CORE = '''
 import numpy as np
 from thresholds import *  # noqa: F401,F403
 from incident import IncidentTracker, default_thresholds, make_tracker  # noqa: F401
+from preprocessing import KINETICS_MEAN, KINETICS_STD
 
 class FakeTensor:
     def __init__(self, arr):
@@ -61,12 +62,14 @@ class FakeTensor:
     def numpy(self):
         return self.arr
 
-def preprocess_batch(clips_uint8):
+def preprocess_batch(clips_uint8, normalize="none"):
     arr = np.ascontiguousarray(clips_uint8).astype(np.float32) / 255.0
+    if normalize == "kinetics":
+        arr = (arr - np.float32(KINETICS_MEAN)) / np.float32(KINETICS_STD)
     return FakeTensor(arr.transpose(0, 4, 1, 2, 3))
 
-def preprocess_clip(frames):
-    return preprocess_batch(np.stack(frames)[None])[0]
+def preprocess_clip(frames, normalize="none"):
+    return preprocess_batch(np.stack(frames)[None], normalize=normalize)[0]
 
 class FakeModel:
     def eval(self):
@@ -84,18 +87,22 @@ def predict_violence(model, batch):
 DRIVER = '''
 import json, sys
 import numpy as np
+import preprocessing
 from inference_core import FakeModel
 from video_calibration import analyze_windows
 from frame_cache import FrameCache
 import clip_eval
 
-video, cache_dir = sys.argv[1], sys.argv[2]
-res = analyze_windows(video, FakeModel(), "cpu")
-cache = FrameCache(cache_dir)
+video, cache_dir, crop, normalize = sys.argv[1:5]
+spec = preprocessing.PreprocSpec(crop, normalize)
+model = preprocessing.attach(FakeModel(), spec)
+res = analyze_windows(video, model, "cpu")
+cache = FrameCache(cache_dir, fmt="npy", crop_mode=crop)
 cache.get(video)  # build
-ev = clip_eval.evaluate_model(FakeModel(), [(video, 1, "Violence", cache.get(video))], "cpu", batch_size=5)
+ev = clip_eval.evaluate_model(model, [(video, 1, "Violence", cache.get(video))], "cpu", batch_size=5)
 vs = ev.scores[0]
 print(json.dumps({
+    "a_preprocessing": res["preprocessing"],
     "a_t": [s["t"] for s in res["samples"]],
     "a_raw": [s["raw"] for s in res["samples"]],
     "a_suitable": [s["suitable"] for s in res["samples"]],
@@ -114,7 +121,9 @@ print(json.dumps({
 
 @unittest.skipUnless(HAVE, "numpy/cv2 not installed")
 class PipelineEquivalenceTests(unittest.TestCase):
-    def run_driver(self, video_path):
+    SPECS = (("frame", "none"), ("clip", "kinetics"), ("clip", "none"), ("frame", "kinetics"))
+
+    def run_driver(self, video_path, crop, normalize):
         stub = os.path.join(self.tmp, "stubs")
         os.makedirs(os.path.join(stub, "torch"), exist_ok=True)
         with open(os.path.join(stub, "torch", "__init__.py"), "w") as f:
@@ -128,7 +137,7 @@ class PipelineEquivalenceTests(unittest.TestCase):
             f.write(DRIVER)
         env = dict(os.environ, PYTHONPATH=os.pathsep.join([stub, _helpers.ROOT]))
         out = subprocess.run(
-            [sys.executable, driver, video_path, os.path.join(self.tmp, "cache")],
+            [sys.executable, driver, video_path, os.path.join(self.tmp, f"cache_{crop}"), crop, normalize],
             capture_output=True, text=True, env=env, cwd=self.tmp, timeout=300,
         )
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -141,7 +150,15 @@ class PipelineEquivalenceTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def check(self, video_path, expect_alert):
-        r = self.run_driver(video_path)
+        for crop, normalize in self.SPECS:
+            with self.subTest(crop=crop, normalize=normalize):
+                self._check_one(video_path, expect_alert, crop, normalize)
+
+    def _check_one(self, video_path, expect_alert, crop, normalize):
+        r = self.run_driver(video_path, crop, normalize)
+        self.assertEqual(r["a_preprocessing"],
+                         {"frame,none": "v1", "clip,kinetics": "v2"}.get(f"{crop},{normalize}",
+                                                                         f"crop={crop},normalize={normalize}"))
         self.assertGreater(len(r["a_t"]), 5)
         self.assertEqual(len(r["a_t"]), len(r["b_t"]))
         for a, b in zip(r["a_t"], r["b_t"]):

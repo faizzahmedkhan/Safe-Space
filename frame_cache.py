@@ -19,10 +19,18 @@ Changing any of those silently creates new entries instead of serving stale
 frames.  Old entries are never deleted automatically; remove the directory to
 reclaim space.
 
-Storage formats:
+What is stored depends on the crop mode of the model's preprocessing
+contract (preprocessing.py):
+  crop="frame": the final 112x112 crop of every frame (prepare_for_model);
+  crop="clip":  every frame's working image (shorter side <= 224) plus its
+                motion box; CachedVideo.window crops each requested clip with
+                frame_prep.build_clip, exactly as the live camera does.
+
+Storage formats ("auto" = npy for crop="frame", jpg for crop="clip"):
   "npy" - raw uint8, loaded with mmap: exact and fastest.  About 37 KB per
-          kept frame (roughly 6 MB for a 10 s clip): keep it on the local
-          disk (e.g. /content/frame_cache on Colab).
+          kept frame in frame mode (roughly 6 MB for a 10 s clip), ~270 KB
+          in clip mode: keep it on the local disk (e.g. /content/frame_cache
+          on Colab).
   "jpg" - JPEG at `jpeg_quality` (default 95): roughly 10-25x smaller, small
           enough for Google Drive, but LOSSY (pixels differ from what live
           mode sees, by a few grey levels on average and up to ~30 at hard
@@ -52,14 +60,18 @@ from clip_sampler import (
     scoring_schedule,
     select_clip_indices,
 )
+from frame_prep import build_clip
 from prepared_frames import PreparedFrameReader
+from preprocessing import CROP_MODES
 from thresholds import CAMERA_TARGET_FPS, CLIP_LENGTH, INFERENCE_STRIDE
 
 log = logging.getLogger("safespace.frame_cache")
 
 # Bump when the on-disk layout or the meaning of a stored field changes.
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 FORMATS = ("npy", "jpg")
+FORMAT_CHOICES = ("auto",) + FORMATS
+NO_BOX = (-1, -1, -1, -1)
 # Modules whose code decides which frames are kept and what they look like.
 FINGERPRINT_MODULES = ("frame_prep", "prepared_frames", "clip_sampler", "thresholds")
 
@@ -77,10 +89,12 @@ def prep_fingerprint(
     max_seconds: float = 0.0,
     fmt: str = "npy",
     jpeg_quality: int = 95,
+    crop_mode: str = "frame",
 ) -> str:
     """Hex digest of every input that determines cached frames."""
     parts = [
         f"format_version={FORMAT_VERSION}",
+        f"crop_mode={crop_mode}",
         f"cv2={cv2.__version__}",
         f"target_fps={float(target_fps)!r}",
         f"max_seconds={float(max_seconds or 0.0)!r}",
@@ -161,15 +175,17 @@ FramesLike = Union[np.ndarray, _LazyJpegFrames]
 
 @dataclass
 class CachedVideo:
-    """A whole video as model-ready frames on the 15 fps camera timeline."""
+    """A whole video as prepared frames on the 15 fps camera timeline."""
 
-    frames: FramesLike  # (N, 112, 112, 3) uint8 RGB
+    frames: FramesLike  # (N, H, W, 3) uint8 RGB: 112x112 crops (frame mode) or working frames (clip mode)
     t: np.ndarray  # (N,) float64 seconds, ascending
     suitable: np.ndarray  # (N,) bool, frame_prep suitable_for_model
     global_motion: np.ndarray  # (N,) bool, frame_prep global_motion
     native_fps: float
     source: str = ""
     fps: float = CAMERA_TARGET_FPS
+    crop_mode: str = "frame"
+    boxes: Optional[np.ndarray] = None  # (N, 4) int32 motion boxes, -1 rows = none (clip mode)
     _schedule: Optional[List[ScheduledWindow]] = field(default=None, repr=False)
     _ready: Optional[List[ScheduledWindow]] = field(default=None, repr=False)
 
@@ -178,9 +194,10 @@ class CachedVideo:
 
     @classmethod
     def from_reader(cls, reader: PreparedFrameReader) -> "CachedVideo":
-        frames, ts, suit, glob = [], [], [], []
+        frames, ts, suit, glob, boxes = [], [], [], [], []
         for pf in reader:
-            frames.append(pf.rgb)
+            frames.append(pf.image)
+            boxes.append(pf.box if pf.box is not None else NO_BOX)
             ts.append(pf.t)
             suit.append(pf.suitable)
             glob.append(pf.global_motion)
@@ -194,6 +211,8 @@ class CachedVideo:
             native_fps=float(reader.native_fps),
             source=reader.path,
             fps=reader.target_fps,
+            crop_mode=reader.crop_mode,
+            boxes=np.asarray(boxes, np.int32).reshape(-1, 4),
         )
 
     # ---------------------------------------------------------- windows
@@ -230,7 +249,8 @@ class CachedVideo:
         return pool[rng.randrange(len(pool))]
 
     def window(self, w: Union[ScheduledWindow, int], n: int = CLIP_LENGTH) -> ClipSample:
-        """The clip ending at `w` exactly as ClipWindow.sample would build it."""
+        """The clip ending at `w` exactly as ClipWindow.sample + clip assembly
+        (prepared_frames.clip_from_items) would build it live."""
         if isinstance(w, ScheduledWindow):
             end, seg_start = w.end, w.seg_start
         else:
@@ -248,15 +268,21 @@ class CachedVideo:
         suitable, global_motion = aggregate_clip_flags(
             self.suitable[uniq].tolist(), self.global_motion[uniq].tolist()
         )
-        return ClipSample(np.asarray(self.frames[idx]), suitable, global_motion, t_end)
+        boxes = self.boxes[idx] if self.boxes is not None else [None] * len(idx)
+        frames = build_clip(np.asarray(self.frames[idx]), boxes, self.crop_mode)
+        return ClipSample(frames, suitable, global_motion, t_end)
 
 
 def extract_video(
-    path: str, target_fps: float = CAMERA_TARGET_FPS, max_seconds: float = 0.0
+    path: str,
+    target_fps: float = CAMERA_TARGET_FPS,
+    max_seconds: float = 0.0,
+    crop_mode: str = "frame",
 ) -> CachedVideo:
     """Prepare a whole video in memory (no disk cache)."""
     return CachedVideo.from_reader(
-        PreparedFrameReader(path, target_fps=target_fps, max_seconds=max_seconds)
+        PreparedFrameReader(path, target_fps=target_fps, max_seconds=max_seconds,
+                            crop_mode=crop_mode)
     )
 
 
@@ -284,13 +310,19 @@ class FrameCache:
     def __init__(
         self,
         root: str,
-        fmt: str = "npy",
+        fmt: str = "auto",
         jpeg_quality: int = 95,
         target_fps: float = CAMERA_TARGET_FPS,
         max_seconds: float = 0.0,
+        crop_mode: str = "frame",
     ):
+        if crop_mode not in CROP_MODES:
+            raise ValueError(f"crop_mode must be one of {CROP_MODES}, got {crop_mode!r}")
+        if fmt == "auto":
+            fmt = "npy" if crop_mode == "frame" else "jpg"
         if fmt not in FORMATS:
-            raise ValueError(f"fmt must be one of {FORMATS}, got {fmt!r}")
+            raise ValueError(f"fmt must be one of {FORMAT_CHOICES}, got {fmt!r}")
+        self.crop_mode = crop_mode
         self.root = root
         self.fmt = fmt
         self.jpeg_quality = int(jpeg_quality)
@@ -304,7 +336,7 @@ class FrameCache:
     def fingerprint(self) -> str:
         if self._fingerprint is None:
             self._fingerprint = prep_fingerprint(
-                self.target_fps, self.max_seconds, self.fmt, self.jpeg_quality
+                self.target_fps, self.max_seconds, self.fmt, self.jpeg_quality, self.crop_mode
             )
         return self._fingerprint
 
@@ -330,7 +362,7 @@ class FrameCache:
         key = self.key_for(video_path)
         if self.has_key(key):
             return key, False
-        video = extract_video(video_path, self.target_fps, self.max_seconds)
+        video = extract_video(video_path, self.target_fps, self.max_seconds, self.crop_mode)
         self._write(key, video)
         return key, True
 
@@ -343,6 +375,8 @@ class FrameCache:
             meta = {k: m[k] for k in m.files}
         if int(meta["format_version"]) != FORMAT_VERSION:
             raise ValueError(f"cache entry {key} has format {int(meta['format_version'])}")
+        if str(meta["crop_mode"]) != self.crop_mode:
+            raise ValueError(f"cache entry {key} is crop_mode={meta['crop_mode']}, cache is {self.crop_mode}")
         if self.fmt == "npy":
             frames: FramesLike = np.load(
                 self._frames_path(key), mmap_mode="r" if mmap else None, allow_pickle=False
@@ -358,6 +392,8 @@ class FrameCache:
             native_fps=float(meta["native_fps"]),
             source=str(meta["source"]),
             fps=float(meta["fps"]),
+            crop_mode=str(meta["crop_mode"]),
+            boxes=meta["boxes"],
         )
 
     def _write(self, key: str, video: CachedVideo) -> None:
@@ -395,6 +431,9 @@ class FrameCache:
                 native_fps=np.float64(video.native_fps),
                 fps=np.float64(video.fps),
                 source=np.str_(video.source),
+                crop_mode=np.str_(video.crop_mode),
+                boxes=(video.boxes if video.boxes is not None
+                       else np.full((len(video), 4), -1, np.int32)).astype(np.int32),
             ),
         )
 
@@ -427,7 +466,8 @@ class FrameCache:
                          done, len(unique), built, reused, len(failed), time.time() - t0)
 
         if workers and workers > 1 and len(unique) > 1:
-            cfg = (self.root, self.fmt, self.jpeg_quality, self.target_fps, self.max_seconds)
+            cfg = (self.root, self.fmt, self.jpeg_quality, self.target_fps, self.max_seconds,
+                   self.crop_mode)
             ctx = multiprocessing.get_context("spawn")
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
                                      initializer=_worker_init) as ex:
@@ -468,8 +508,8 @@ def _build_one_with(cache: FrameCache, path: str) -> Tuple[str, Optional[str], b
 
 
 def _build_one(cfg: Tuple[Any, ...], path: str) -> Tuple[str, Optional[str], bool, Optional[str]]:
-    root, fmt, quality, fps, max_s = cfg
-    return _build_one_with(FrameCache(root, fmt, quality, fps, max_s), path)
+    root, fmt, quality, fps, max_s, crop_mode = cfg
+    return _build_one_with(FrameCache(root, fmt, quality, fps, max_s, crop_mode), path)
 
 
 __all__ = [

@@ -1,9 +1,10 @@
 """Training dataset over the frame cache, shared by train.py and the notebook.
 
 Each item is one random ready 16-frame window of one cached video (a new
-window every epoch), optionally horizontally flipped, preprocessed with
-inference_core.preprocess_batch (/255 only, (C, T, H, W)), i.e. the same
-tensor live mode builds.  No video decoding or frame_prep happens here.
+window every epoch), assembled with the cache's crop mode, optionally
+horizontally flipped, and converted by inference_core.preprocess_batch with
+the preprocessing contract's normalization -> (C, T, H, W), i.e. the same
+tensor live mode builds.  No video decoding happens here.
 
 Randomness comes from the `random` module, so seed it once in the main
 process and pass seed_worker as the DataLoader's worker_init_fn (plus a
@@ -22,6 +23,7 @@ from torch.utils.data import Dataset
 
 from frame_cache import CachedVideo, FrameCache
 from inference_core import preprocess_batch
+from preprocessing import LEGACY_PREPROC, PreprocSpec
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,14 @@ class CachedClipDataset(Dataset):
         items: Sequence[CacheItem],
         windows_per_video: int = 1,
         hflip: bool = False,
+        preprocessing: PreprocSpec = LEGACY_PREPROC,
     ):
+        if cache.crop_mode != preprocessing.crop:
+            raise ValueError(
+                f"cache crop_mode={cache.crop_mode!r} does not match preprocessing "
+                f"{preprocessing.name} (crop={preprocessing.crop!r})"
+            )
+        self.preprocessing = preprocessing
         self.cache = cache
         self.items = list(items)
         self.windows_per_video = max(1, int(windows_per_video))
@@ -77,7 +86,7 @@ class CachedClipDataset(Dataset):
         clip = video.window(video.random_window(random)).frames  # (T, H, W, C)
         if self.hflip and random.random() < 0.5:
             clip = clip[:, :, ::-1, :]  # same flip for every frame of the clip
-        x = preprocess_batch(clip[None])[0]
+        x = preprocess_batch(clip[None], normalize=self.preprocessing.normalize)[0]
         return x, torch.tensor(item.label, dtype=torch.long)
 
 
