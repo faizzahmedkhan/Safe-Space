@@ -32,13 +32,17 @@ unit tests without extra dependencies.
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from incident import make_tracker
+
+log = logging.getLogger("safespace.clip_eval")
 
 CLIP_SCORES = ("first_p", "max_p", "mean_p", "peak_smoothed")
 DEFAULT_TARGET_NORMAL_RECALL = 0.90
@@ -299,6 +303,7 @@ def score_videos(
     videos: Iterable[Tuple[str, int, str, Any]],
     device,
     batch_size: int = 32,
+    log_every: int = 50,
 ) -> List[VideoScores]:
     """Score every live-schedule window of every video.
 
@@ -309,7 +314,8 @@ def score_videos(
     cached with another crop mode is an error, not a silent mismatch.
     Leaves the model in eval() mode:
     the caller restores its own train mode (train.py keeps frozen BatchNorm
-    in eval, so a blanket model.train() here would be wrong)."""
+    in eval, so a blanket model.train() here would be wrong).  Logs progress
+    every `log_every` videos (0 = silent)."""
     import torch  # noqa: F401  (lazy: metric code above stays torch-free)
 
     import preprocessing
@@ -317,6 +323,8 @@ def score_videos(
 
     spec = preprocessing.of_model(model)
     model.eval()
+    t0 = time.time()
+    n_windows = 0
     results: List[VideoScores] = []
     pending: List[Tuple[int, int, np.ndarray]] = []  # (video_idx, window_idx, frames)
     raw_store: List[np.ndarray] = []
@@ -361,7 +369,15 @@ def score_videos(
             pending.append((vi, wi, c.frames))
             if len(pending) >= batch_size:
                 flush()
+        n_windows += len(clips)
+        if log_every and len(results) % log_every == 0:
+            dt = time.time() - t0
+            log.info("evaluation: %d videos, %d windows scored (%.0f windows/s, %.0fs)",
+                     len(results), n_windows, n_windows / max(dt, 1e-9), dt)
     flush()
+    if log_every:
+        dt = time.time() - t0
+        log.info("evaluation done: %d videos, %d windows in %.0fs", len(results), n_windows, dt)
     return results
 
 
