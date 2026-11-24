@@ -27,7 +27,7 @@ import torch.nn.functional as F
 import torchvision.models.video as video_models
 
 from clip_sampler import ClipWindow, FpsResampler, select_clip_indices  # noqa: F401
-from incident import IncidentTracker  # noqa: F401
+from incident import IncidentTracker, default_thresholds, make_tracker  # noqa: F401  (re-exported)
 from thresholds import (  # noqa: F401  (re-exported)
     ALERT_COOLDOWN_SECONDS,
     ALERT_THRESHOLD,
@@ -61,44 +61,27 @@ MODEL_CANDIDATES = [
 FORWARD_LOCK = threading.Lock()
 
 
-def default_thresholds() -> Dict[str, Any]:
-    return {
-        "alert_threshold": ALERT_THRESHOLD,
-        "spike_threshold": SPIKE_THRESHOLD,
-        "score_history_len": SCORE_HISTORY_LEN,
-        "alert_cooldown_seconds": ALERT_COOLDOWN_SECONDS,
-        "post_roll_seconds": POST_ROLL_SECONDS,
-        "min_incident_seconds": MIN_INCIDENT_SECONDS,
-        "max_incident_seconds": MAX_INCIDENT_SECONDS,
-        "spike_requires_confirmation": SPIKE_REQUIRES_CONFIRMATION,
-    }
-
-
-def make_tracker(thresholds: Optional[Dict[str, Any]] = None, **overrides: Any) -> IncidentTracker:
-    t = {**default_thresholds(), **(thresholds or {})}
-    t.update({k: v for k, v in overrides.items() if v is not None})
-    return IncidentTracker(
-        alert_threshold=float(t["alert_threshold"]),
-        spike_threshold=float(t["spike_threshold"]),
-        history_len=int(t["score_history_len"]),
-        cooldown_s=float(t["alert_cooldown_seconds"]),
-        post_roll_s=float(t["post_roll_seconds"]),
-        min_s=float(t["min_incident_seconds"]),
-        max_s=float(t["max_incident_seconds"]),
-        spike_requires_confirmation=bool(t["spike_requires_confirmation"]),
-    )
-
-
 # ---------------------------------------------------------------- preprocessing
 def preprocess_clip(frames_rgb_112: List[np.ndarray]) -> torch.Tensor:
     """List of T uint8 RGB frames (H, W, 3) -> float tensor (C, T, H, W) in
     [0, 1].  /255 only: the training notebook never applies Kinetics
     mean/std, so doing so here would silently put every prediction
     out-of-distribution."""
-    arr = np.stack(frames_rgb_112)  # (T, H, W, C)
-    tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).float()  # (T, C, H, W)
+    return preprocess_batch(np.stack(frames_rgb_112)[None])[0]
+
+
+def preprocess_batch(clips_uint8: np.ndarray) -> torch.Tensor:
+    """(B, T, H, W, 3) uint8 RGB clips -> float tensor (B, C, T, H, W) in
+    [0, 1].  The one implementation behind preprocess_clip, the training
+    datasets and batched evaluation (clip_eval), so they cannot drift."""
+    arr = np.ascontiguousarray(clips_uint8)  # flipped / memmap views are fine
+    if not arr.flags.writeable:  # torch.from_numpy warns on read-only memory
+        arr = arr.copy()
+    if arr.ndim != 5 or arr.shape[-1] != 3:
+        raise ValueError(f"expected (B, T, H, W, 3) clips, got shape {arr.shape}")
+    tensor = torch.from_numpy(arr).float()  # (B, T, H, W, C)
     tensor.div_(255.0)
-    return tensor.permute(1, 0, 2, 3).contiguous()  # (C, T, H, W)
+    return tensor.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, T, H, W)
 
 
 def predict_violence(model: nn.Module, batch: torch.Tensor) -> torch.Tensor:

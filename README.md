@@ -179,12 +179,35 @@ To fine-tune the model using custom videos:
 
 ```powershell
 python train.py
+python -m unittest discover -s tests   # optional: verify the pipeline first
 ```
 
 `train.py` fine-tunes the currently selected model (layer4 at 1e-5, fc at 1e-3, earlier
 layers frozen, sqrt class weights, 15% validation hold-out, fixed seed) using the same
 frame preparation as live mode. It **never overwrites** weights: it writes
-`safespace_bullying_model_ft_<timestamp>.pth` plus a `.json` sidecar.
+`safespace_bullying_model_ft_<timestamp>.pth` plus a `.json` sidecar (which includes the
+validation report of the chosen epoch).
+
+Useful options: `--epochs`, `--windows-per-video` (random training windows per video per
+epoch), `--selection-metric`, `--cache-dir`, `--cache-format npy|jpg`, `--cache-workers`.
+
+**Frame cache.** Every video is prepared once (15 fps resampling + `frame_prep`, exactly
+as `/analyze/video` does) and stored in `.frame_cache/`; training and validation then read
+16-frame windows from it instead of re-decoding videos every epoch. Windows from the cache
+are bit-identical to on-the-fly preparation (`npy` format; `jpg` is ~10-25x smaller but
+lossy). Entries are keyed by video content plus a fingerprint of the frame code, so
+editing `frame_prep.py` never serves stale frames. The folder is safe to delete.
+
+**Best-epoch selection.** Validation scores every clip the way live mode does
+(`clip_eval.py`): a window every 8 frames over the whole clip, replayed through
+`IncidentTracker`. Each epoch prints PR-AUC/ROC-AUC per clip score, Dangerous recall at
+Normal recall >= 0.90, and the live incident rule's confusion matrix. The epoch with the
+best `--selection-metric` (default `pr_auc_max`, threshold-free) is kept.
+
+The Colab notebook (`SafeSpace_Weaponized (1).ipynb`) uses the same modules; upload
+`thresholds.py clip_sampler.py incident.py frame_prep.py prepared_frames.py frame_cache.py
+clip_eval.py inference_core.py cached_dataset.py` next to it. Its final-report cell
+evaluates on validation until you set `RUN_FINAL_TEST = True`; score the test split once.
 
 3. Restart the backend with the new weights, then re-run `video_calibration.py` on some
    footage and adjust the sidecar thresholds if needed:

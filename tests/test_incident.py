@@ -200,5 +200,17 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(ev[0]["reason"], "end_of_video")
 
 
+class FactoryTests(unittest.TestCase):
+    def test_make_tracker_defaults_and_overrides(self):
+        from incident import default_thresholds, make_tracker
+        from thresholds import ALERT_THRESHOLD, SPIKE_THRESHOLD
+
+        t = make_tracker()
+        self.assertEqual((t.alert_threshold, t.spike_threshold), (ALERT_THRESHOLD, SPIKE_THRESHOLD))
+        t = make_tracker({"alert_threshold": 0.5}, spike_threshold=0.8, score_history_len=None)
+        self.assertEqual((t.alert_threshold, t.spike_threshold), (0.5, 0.8))
+        self.assertEqual(t.history.maxlen, default_thresholds()["score_history_len"])
+
+
 if __name__ == "__main__":
     unittest.main()

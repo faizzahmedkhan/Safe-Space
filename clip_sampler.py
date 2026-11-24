@@ -11,14 +11,19 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import deque
-from typing import Any, Deque, List, Optional, Sequence
+from typing import Any, Deque, List, NamedTuple, Optional, Sequence, Tuple
 
 from thresholds import (
     CAMERA_TARGET_FPS,
     CLIP_FRACTION,
     CLIP_LENGTH,
+    INFERENCE_STRIDE,
     MAX_FRAME_GAP_S,
 )
+
+# A clip is "ready" once the stored history reaches back to its first target
+# time, give or take this much (ClipWindow and scoring_schedule share it).
+START_TOLERANCE_S = 0.1
 
 
 def select_clip_indices(
@@ -87,6 +92,68 @@ def window_coverage(
     return round(min(100.0, 100.0 * covered / total), 1)
 
 
+def aggregate_clip_flags(
+    suitable: Sequence[bool], global_motion: Sequence[bool]
+) -> Tuple[bool, bool]:
+    """Clip-level (suitable, global_motion) from the per-frame flags of the
+    clip's UNIQUE frames: each is True when at least CLIP_FRACTION of them are.
+    Shared by ClipWindow.sample (live) and frame_cache (training/eval)."""
+    n_s = len(suitable)
+    n_g = len(global_motion)
+    return (
+        sum(bool(x) for x in suitable) >= CLIP_FRACTION * n_s,
+        sum(bool(x) for x in global_motion) >= CLIP_FRACTION * n_g,
+    )
+
+
+class ScheduledWindow(NamedTuple):
+    """One window that live mode would score on a recorded timeline."""
+
+    end: int  # index of the newest frame of the clip
+    seg_start: int  # first frame index of the continuous segment it lies in
+    segment: int  # 0-based segment number (bumps after every frame gap)
+
+
+def scoring_schedule(
+    timestamps: Sequence[float],
+    n: int = CLIP_LENGTH,
+    fps: float = CAMERA_TARGET_FPS,
+    stride_frames: int = INFERENCE_STRIDE,
+    max_gap: float = MAX_FRAME_GAP_S,
+    start_tolerance_s: float = START_TOLERANCE_S,
+) -> List[ScheduledWindow]:
+    """Which windows of an already-recorded (ascending) frame timeline live
+    mode would score, replicating video_calibration.analyze_windows exactly:
+
+      * a frame gap > max_gap starts a new segment (ClipWindow is cleared and
+        the scoring clock restarts);
+      * a window becomes available once the segment reaches back one clip span
+        (ClipWindow.sample's readiness rule);
+      * after a scored window, the next one is scored once at least
+        stride_frames / fps seconds have passed.
+    """
+    span = (n - 1) / float(fps)
+    stride_s = stride_frames / float(fps)
+    out: List[ScheduledWindow] = []
+    seg_start = 0
+    segment = 0
+    last_scored: Optional[float] = None
+    prev: Optional[float] = None
+    for i, t in enumerate(timestamps):
+        if detect_gap(prev, t, max_gap):
+            seg_start = i
+            segment += 1
+            last_scored = None
+        prev = t
+        if timestamps[seg_start] > t - span + start_tolerance_s:
+            continue  # not enough history yet
+        if last_scored is not None and (t - last_scored) < stride_s - 1e-6:
+            continue
+        last_scored = t
+        out.append(ScheduledWindow(i, seg_start, segment))
+    return out
+
+
 class FpsResampler:
     """Decide which frames of a fixed-fps file to keep so the kept stream looks
     like a live camera paced at `target_fps` (used by the offline tools)."""
@@ -116,7 +183,7 @@ class ClipWindow:
         retain_s: float = 3.0,
         max_items: int = 128,
         max_gap: float = MAX_FRAME_GAP_S,
-        start_tolerance_s: float = 0.1,
+        start_tolerance_s: float = START_TOLERANCE_S,
     ):
         self.n = n
         self.fps = float(fps)
@@ -177,8 +244,9 @@ class ClipWindow:
         if idx is None:
             return None
         uniq = sorted(set(idx))
-        suit = [self.suitable[i] for i in uniq]
-        glob = [self.global_motion[i] for i in uniq]
+        suitable, global_motion = aggregate_clip_flags(
+            [self.suitable[i] for i in uniq], [self.global_motion[i] for i in uniq]
+        )
         picked = [ts[i] for i in idx]
         return {
             "indices": idx,
@@ -187,6 +255,6 @@ class ClipWindow:
             "t_end": t_end,
             "span_s": picked[-1] - picked[0],
             "unique_frames": len(uniq),
-            "suitable": sum(suit) >= CLIP_FRACTION * len(suit),
-            "global_motion": sum(glob) >= CLIP_FRACTION * len(glob),
+            "suitable": suitable,
+            "global_motion": global_motion,
         }

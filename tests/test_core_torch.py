@@ -74,5 +74,107 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(tr.history.maxlen, 6)
 
 
+@unittest.skipUnless(HAVE, "torch/numpy/cv2 not installed")
+class CachedPipelineTorchTests(unittest.TestCase):
+    """Real-torch counterparts of test_pipeline_equivalence / test_frame_cache."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil  # noqa: F401
+        from tests._video import write_video
+
+        cls.tmp = tempfile.mkdtemp(prefix="ss_torch_cache_")
+        cls.video = write_video(os.path.join(cls.tmp, "v.avi"), fps=30.0, seconds=4.0)
+        torch.manual_seed(0)
+        cls.model = core.build_model().eval()  # random weights: equality, not accuracy
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_preprocess_batch_matches_preprocess_clip(self):
+        rng = np.random.RandomState(1)
+        clips = rng.randint(0, 256, (3, 16, 112, 112, 3)).astype(np.uint8)
+        batch = core.preprocess_batch(clips)
+        self.assertEqual(tuple(batch.shape), (3, 3, 16, 112, 112))
+        for i in range(3):
+            self.assertTrue(torch.equal(batch[i], core.preprocess_clip(list(clips[i]))))
+        flipped = clips[:, :, :, ::-1, :]  # negative-stride view must work
+        self.assertTrue(torch.equal(core.preprocess_batch(flipped), core.preprocess_batch(flipped.copy())))
+        with self.assertRaises(ValueError):
+            core.preprocess_batch(clips[0])
+
+    def test_cached_scores_match_analyze_windows(self):
+        import clip_eval
+        from frame_cache import FrameCache
+        from video_calibration import analyze_windows
+
+        dev = torch.device("cpu")
+        ref = analyze_windows(self.video, self.model, dev)
+        cache = FrameCache(os.path.join(self.tmp, "cache"))
+        res = clip_eval.evaluate_model(
+            self.model, [(self.video, 1, "Violence", cache.get(self.video))], dev, batch_size=3
+        )
+        vs = res.scores[0]
+        self.assertEqual(len(ref["samples"]), vs.n_windows)
+        for s, raw, t in zip(ref["samples"], vs.raw, vs.t_end):
+            self.assertAlmostEqual(s["t"], t, places=9)
+            self.assertAlmostEqual(s["raw"], float(raw), places=5)  # batched vs single forward
+        self.assertEqual(len(ref["incidents"]), res.rows[0]["n_incidents"])
+
+    def test_cached_dataset_items(self):
+        import random
+
+        from cached_dataset import CacheItem, CachedClipDataset
+        from frame_cache import FrameCache
+
+        cache = FrameCache(os.path.join(self.tmp, "ds"))
+        key, _ = cache.ensure(self.video)
+        ds = CachedClipDataset(cache, [CacheItem(key, 1, self.video, "Violence")],
+                               windows_per_video=3, hflip=True)
+        self.assertEqual(len(ds), 3)
+        random.seed(0)
+        x, y = ds[2]
+        self.assertEqual(tuple(x.shape), (3, 16, 112, 112))
+        self.assertEqual(x.dtype, torch.float32)
+        self.assertEqual(int(y), 1)
+        self.assertLessEqual(float(x.max()), 1.0)
+        self.assertEqual(ds.labels, [1])
+        self.assertEqual(ds.classes, ["Violence"])
+
+    def test_train_script_smoke(self):
+        import shutil
+
+        import train
+        from tests._video import write_video
+
+        data = os.path.join(self.tmp, "data")
+        for cls, n, bursts in (("safe", 4, ()), ("unsafe", 4, ((0.5, 2.5),))):
+            os.makedirs(os.path.join(data, cls), exist_ok=True)
+            for i in range(n):
+                write_video(os.path.join(data, cls, f"{cls}{i}.avi"), fps=30.0, seconds=3.0,
+                            bursts=bursts, seed=i)
+        base = os.path.join(self.tmp, "base.pth")
+        torch.save(self.model.state_dict(), base)
+        out_dir = os.path.join(self.tmp, "out")
+        os.makedirs(out_dir)
+        args = train.parse_args([
+            "--data-dir", data, "--out-dir", out_dir, "--base-model", base,
+            "--epochs", "1", "--batch-size", "2", "--windows-per-video", "1",
+            "--val-frac", "0.25", "--cache-dir", os.path.join(self.tmp, "train_cache"),
+            "--cache-workers", "1",
+        ])
+        out = train.train(args)
+        self.assertTrue(out and os.path.isfile(out))
+        with open(os.path.splitext(out)[0] + ".json") as f:
+            side = json.load(f)
+        self.assertEqual(side["selection"]["metric"], "pr_auc_max")
+        self.assertEqual(side["best_epoch"], 1)
+        self.assertIn("live", side["selection"]["validation"])
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

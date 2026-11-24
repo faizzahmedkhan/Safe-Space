@@ -215,3 +215,32 @@ class IncidentTracker:
             "duration": t - inc["start_t"],
             **{k: inc[k] for k in ("start_t", "trigger", "confidence", "peak", "n_triggers")},
         }
+
+
+# ---------------------------------------------------------------- factory
+def default_thresholds() -> Dict[str, Any]:
+    return {
+        "alert_threshold": ALERT_THRESHOLD,
+        "spike_threshold": SPIKE_THRESHOLD,
+        "score_history_len": SCORE_HISTORY_LEN,
+        "alert_cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+        "post_roll_seconds": POST_ROLL_SECONDS,
+        "min_incident_seconds": MIN_INCIDENT_SECONDS,
+        "max_incident_seconds": MAX_INCIDENT_SECONDS,
+        "spike_requires_confirmation": SPIKE_REQUIRES_CONFIRMATION,
+    }
+
+
+def make_tracker(thresholds: Optional[Dict[str, Any]] = None, **overrides: Any) -> IncidentTracker:
+    t = {**default_thresholds(), **(thresholds or {})}
+    t.update({k: v for k, v in overrides.items() if v is not None})
+    return IncidentTracker(
+        alert_threshold=float(t["alert_threshold"]),
+        spike_threshold=float(t["spike_threshold"]),
+        history_len=int(t["score_history_len"]),
+        cooldown_s=float(t["alert_cooldown_seconds"]),
+        post_roll_s=float(t["post_roll_seconds"]),
+        min_s=float(t["min_incident_seconds"]),
+        max_s=float(t["max_incident_seconds"]),
+        spike_requires_confirmation=bool(t["spike_requires_confirmation"]),
+    )

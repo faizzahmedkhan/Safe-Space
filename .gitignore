@@ -2,6 +2,7 @@ evidence/
 uploads/
 logs/
 calibration_out/
+.frame_cache/
 *.web.mp4
 context.md
 

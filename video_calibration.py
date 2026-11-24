@@ -5,7 +5,8 @@ Offline calibration tool for the SafeSpace violence-detection model.
 
 Feed it any video file (an action movie clip, a UFC fight, a fighting
 compilation) and it will:
-  1. Run the exact same frame prep (frame_prep.prepare_for_model) and
+  1. Run the exact same frame prep (prepared_frames.PreparedFrameReader ->
+     frame_prep.prepare_for_model) and
      windowing/threshold logic used live in main.py / camera.py.
   2. Log the raw model score for every inference window to a CSV so you
      can plot/inspect where the model's confidence actually sits.
@@ -33,7 +34,6 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import math
 import os
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,8 +43,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from clip_sampler import ClipWindow, FpsResampler
-from frame_prep import prepare_for_model
+from clip_sampler import ClipWindow
 from inference_core import (
     CAMERA_TARGET_FPS,
     CLIP_LENGTH,
@@ -57,6 +56,8 @@ from inference_core import (
     predict_violence,
     preprocess_clip,
 )
+
+from prepared_frames import PreparedFrameReader
 
 log = logging.getLogger("safespace.calibration")
 
@@ -84,18 +85,9 @@ def analyze_windows(
     """Run a video through exactly the live pipeline: frame_prep (HOG off) ->
     15 fps timeline resample -> timestamp clip sampling -> /255 -> model ->
     IncidentTracker.  Returns raw per-window samples plus incident records."""
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-
-    native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    if not math.isfinite(native_fps) or native_fps <= 1e-3:
-        native_fps = float(target_fps)
-    native_dt = 1.0 / native_fps
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    reader = PreparedFrameReader(path, target_fps=target_fps, max_seconds=max_seconds)
     stride_s = INFERENCE_STRIDE / float(target_fps)
 
-    resampler = FpsResampler(target_fps)
     window = ClipWindow(n=CLIP_LENGTH, fps=target_fps)
     tracker = make_tracker(
         thresholds,
@@ -107,12 +99,10 @@ def analyze_windows(
     samples: List[Dict[str, Any]] = []
     incidents: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
-    prev_gray = None
     last_scored: Optional[float] = None
     last_meta: Dict[str, Any] = {}
     suitable_count = unsuitable_count = global_count = 0
     peak_raw = peak_smoothed = 0.0
-    frame_idx = 0
     last_t = 0.0
     model.eval()
 
@@ -135,31 +125,18 @@ def analyze_windows(
                 current["close_reason"] = ev["reason"]
                 current = None
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        t = frame_idx / native_fps
-        src_index = frame_idx + 1
-        frame_idx += 1
-        if max_seconds and t > max_seconds:
-            break
-        if not resampler.keep(t, native_dt):
-            continue
-
-        rgb, meta, prev_gray = prepare_for_model(
-            frame, prev_gray, person_box_cache=None, run_person_detector=False
-        )
+    for pf in reader:  # closes the capture when exhausted
+        t = pf.t
+        meta = pf.meta
         last_meta = meta
         last_t = t
-        if meta.get("suitable_for_model"):
+        if pf.suitable:
             suitable_count += 1
         else:
             unsuitable_count += 1
-        if meta.get("global_motion"):
+        if pf.global_motion:
             global_count += 1
-        if window.add(t, rgb, meta.get("suitable_for_model", True), meta.get("global_motion", False)):
-            prev_gray = None
+        if window.add(t, pf.rgb, pf.suitable, pf.global_motion):
             handle(tracker.reset(t, reason="gap"))
             last_scored = None
 
@@ -182,7 +159,7 @@ def analyze_windows(
         trig = next((e for e in events if e["type"] in ("open", "extend")), None)
         samples.append({
             "t": t,
-            "frame": src_index,
+            "frame": pf.src_index,
             "raw": raw,
             "smoothed": avg,
             "triggered": trig is not None,
@@ -193,17 +170,17 @@ def analyze_windows(
             "meta": meta,
         })
 
-    cap.release()
+    reader.close()
     handle(tracker.finish(last_t))
     for inc in incidents:
         if inc["end_t"] is None:
             inc["end_t"] = last_t
 
     return {
-        "native_fps": native_fps,
-        "total_frames": total_frames,
-        "frames_read": frame_idx,
-        "duration_sec": frame_idx / native_fps,
+        "native_fps": reader.native_fps,
+        "total_frames": reader.total_frames,
+        "frames_read": reader.frames_read,
+        "duration_sec": reader.frames_read / reader.native_fps,
         "samples": samples,
         "incidents": incidents,
         "suitable_count": suitable_count,

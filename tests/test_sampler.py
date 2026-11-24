@@ -5,7 +5,9 @@ from tests import _helpers  # noqa: F401
 from clip_sampler import (
     ClipWindow,
     FpsResampler,
+    aggregate_clip_flags,
     detect_gap,
+    scoring_schedule,
     select_clip_indices,
     window_coverage,
 )
@@ -139,6 +141,55 @@ class CoverageAndResampler(unittest.TestCase):
         r = FpsResampler(15)
         kept = [i for i in range(250) if r.keep(i / 25.0, 1 / 25.0)]
         self.assertAlmostEqual(len(kept), 150, delta=6)
+
+
+def streamed_schedule(ts, stride_frames=8, fps=15.0):
+    """What analyze_windows scores, computed by streaming into a ClipWindow."""
+    w = ClipWindow()
+    out, last = [], None
+    for i, t in enumerate(ts):
+        if w.add(t, i):
+            last = None
+        if w.sample() is None:
+            continue
+        if last is not None and (t - last) < stride_frames / fps - 1e-6:
+            continue
+        last = t
+        out.append(i)
+    return out
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_matches_streaming_clipwindow(self):
+        for fps in (8, 12, 15, 25, 30):
+            ts = stamps(fps, seconds=7.0)
+            self.assertEqual([w.end for w in scoring_schedule(ts)], streamed_schedule(ts), f"fps={fps}")
+
+    def test_matches_streaming_with_gaps(self):
+        ts = stamps(15, 3.0) + stamps(15, 2.5, t0=55.0) + stamps(15, 0.4, t0=60.0)
+        sched = scoring_schedule(ts)
+        self.assertEqual([w.end for w in sched], streamed_schedule(ts))
+        self.assertEqual(sorted({w.segment for w in sched}), [0, 1])  # last segment too short
+        for w in sched:
+            self.assertLessEqual(ts[w.seg_start], ts[w.end])
+            self.assertTrue(all(not detect_gap(a, b) for a, b in zip(ts[w.seg_start:w.end], ts[w.seg_start + 1:w.end + 1])))
+
+    def test_stride_and_first_window(self):
+        ts = stamps(15, seconds=4.0)
+        ends = [w.end for w in scoring_schedule(ts)]
+        self.assertEqual(ends[0], 14)  # first full clip (0.1 s start tolerance)
+        self.assertTrue(all(b - a == 8 for a, b in zip(ends, ends[1:])))
+
+    def test_stride_zero_gives_every_ready_frame(self):
+        ts = stamps(15, seconds=2.0)
+        self.assertEqual([w.end for w in scoring_schedule(ts, stride_frames=0)], list(range(14, 30)))
+
+    def test_empty(self):
+        self.assertEqual(scoring_schedule([]), [])
+
+    def test_aggregate_flags(self):
+        self.assertEqual(aggregate_clip_flags([1, 1, 0, 0], [0, 0, 0, 1]), (True, False))
+        self.assertEqual(aggregate_clip_flags([1, 0, 0], [1, 1, 0]), (False, True))
 
 
 if __name__ == "__main__":
