@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import logging
+import multiprocessing
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -400,8 +401,11 @@ class FrameCache:
     def build_many(
         self, paths: Sequence[str], workers: int = 0, log_every: int = 100
     ) -> BuildReport:
-        """Cache every path (idempotent).  workers > 1 uses processes; on
-        Windows call this under `if __name__ == "__main__":`."""
+        """Cache every path (idempotent).  workers > 1 uses processes started
+        with "spawn": forking a process that has already used OpenCV can
+        deadlock the child (OpenCV's thread pool does not survive fork), and
+        notebooks always have.  Spawned workers re-import this module, so
+        scripts must call this under `if __name__ == "__main__":`."""
         t0 = time.time()
         keys: Dict[str, str] = {}
         failed: Dict[str, str] = {}
@@ -424,7 +428,9 @@ class FrameCache:
 
         if workers and workers > 1 and len(unique) > 1:
             cfg = (self.root, self.fmt, self.jpeg_quality, self.target_fps, self.max_seconds)
-            with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as ex:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                     initializer=_worker_init) as ex:
                 futs = {ex.submit(_build_one, cfg, p): p for p in unique}
                 for fut in as_completed(futs):
                     record(*fut.result())
