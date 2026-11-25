@@ -179,5 +179,83 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(ce.selection_value(one_class, "pr_auc_max"), -math.inf)
 
 
+@unittest.skipUnless(HAVE, "numpy not installed")
+class UncertaintyTests(unittest.TestCase):
+    @staticmethod
+    def rows(sep=1.0, n=300, seed=0, n_windows=3):
+        rng = np.random.default_rng(seed)
+        out = []
+        for i in range(n):
+            y = int(i % 3 != 0)
+            p = float(np.clip(rng.normal(0.45 + 0.3 * sep * y, 0.2), 0, 1))
+            out.append({"path": f"clip{i}", "class": "Violence" if y else "Normal", "y_true": y,
+                        "n_windows": n_windows, "short": False, "first_p": p, "max_p": p, "mean_p": p,
+                        "peak_smoothed": p, "would_alert": p > 0.8, "n_incidents": int(p > 0.8),
+                        "trigger": "spike" if p > 0.8 else "", "suitable_frac": 1.0})
+        return out
+
+    def test_intervals_contain_point_value(self):
+        ci = ce.bootstrap_metrics(self.rows(), n_boot=300)
+        self.assertEqual(set(ci), set(ce.CI_METRICS))
+        for m in ci.values():
+            self.assertLessEqual(m["low"], m["value"])
+            self.assertLessEqual(m["value"], m["high"])
+
+    def test_cluster_resampling_widens_intervals(self):
+        # 300 clips that are really 30 clusters of 10 near-identical copies:
+        # resampling clips pretends there are 300 independent samples.
+        base = self.rows(n=30, seed=3)
+        rows = [dict(r, path=f"{r['path']}_{k}") for r in base for k in range(10)]
+        groups = {r["path"]: r["path"].split("_")[0] for r in rows}
+        naive = ce.bootstrap_metrics(rows, metrics=["roc_auc_max"], n_boot=400)["roc_auc_max"]
+        grouped = ce.bootstrap_metrics(rows, groups=groups, metrics=["roc_auc_max"], n_boot=400)["roc_auc_max"]
+        self.assertGreater(grouped["high"] - grouped["low"], 1.8 * (naive["high"] - naive["low"]))
+
+    def test_compare_identical_runs(self):
+        a = self.rows()
+        cmp = ce.compare_runs(a, [dict(r) for r in a], n_boot=200)
+        for name in ce.CI_METRICS:
+            self.assertEqual(cmp[name]["diff"], 0.0)
+            self.assertEqual((cmp[name]["low"], cmp[name]["high"]), (0.0, 0.0))
+            self.assertEqual(cmp[name]["p_b_not_better"], 1.0)
+
+    def test_compare_detects_a_better_run(self):
+        a = self.rows(sep=0.6, seed=1)
+        b = [dict(r, max_p=min(1.0, r["max_p"] + (0.25 if r["y_true"] else 0.0))) for r in a]
+        cmp = ce.compare_runs(a, b, n_boot=300)["roc_auc_max"]
+        self.assertGreater(cmp["diff"], 0)
+        self.assertGreater(cmp["low"], 0)
+        self.assertLess(cmp["p_b_not_better"], 0.05)
+        text = ce.format_comparison(ce.compare_runs(a, b, n_boot=50), "base", "new")
+        self.assertIn("difference = new - base", text)
+
+    def test_compare_uses_shared_clips_and_checks_labels(self):
+        a = self.rows()
+        self.assertEqual(ce.compare_runs(a, a[:100], n_boot=20)["_n_clips"]["value"], 100)
+        with self.assertRaises(ValueError):
+            ce.compare_runs(a, [dict(r, path="other" + r["path"]) for r in a])
+        flipped = [dict(r, y_true=1 - r["y_true"]) for r in a]
+        with self.assertRaises(ValueError):
+            ce.compare_runs(a, flipped)
+
+    def test_csv_roundtrip(self):
+        import os
+        import tempfile
+
+        rows = self.rows(n=20)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "scores.csv")
+            ce.write_rows_csv(rows, path)
+            self.assertEqual(ce.read_rows_csv(path), rows)
+
+    def test_live_rule_reported_on_long_clips(self):
+        self.assertEqual(ce.LIVE_RULE_MIN_WINDOWS, 5)
+        rows = self.rows(n=30, n_windows=1) + self.rows(n=12, seed=4, n_windows=6)
+        s = ce.summarize(rows)
+        self.assertEqual(s["live_long_clips"]["n_clips"], 12)
+        self.assertEqual(s["live_long_clips"]["min_windows"], 5)
+        self.assertIn("clips with >= 5 windows (12 clips", ce.format_summary(s))
+
+
 if __name__ == "__main__":
     unittest.main()

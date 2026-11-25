@@ -215,7 +215,22 @@ code, so editing `frame_prep.py` never serves stale frames. The folder is safe t
 (`clip_eval.py`): a window every 8 frames over the whole clip, replayed through
 `IncidentTracker`. Each epoch prints PR-AUC/ROC-AUC per clip score, Dangerous recall at
 Normal recall >= 0.90, and the live incident rule's confusion matrix. The epoch with the
-best `--selection-metric` (default `pr_auc_max`, threshold-free) is kept.
+best `--selection-metric` (default `pr_auc_max`, threshold-free) is kept. The live rule is
+also reported on just the clips long enough for it to fire (at least 5 windows), since most
+SCVD clips are about 1 s long.
+
+**Comparing runs.** Differences of a few hundredths between runs are within run-to-run noise
+on a 400-clip validation set. The notebook's report prints 95% bootstrap intervals (whole
+similarity clusters are resampled) and saves each run's per-clip scores as a CSV. To compare
+two runs on the same clips:
+
+```bash
+python compare_runs.py val_scores_A.csv val_scores_B.csv --manifest clean_split_manifest.csv --labels A B
+```
+
+An interval for B - A that excludes 0 is a real difference; one spanning 0 is not. The
+notebook's last cell does the same, and can also re-score older saved weights to produce
+their CSV.
 
 The Colab notebook (`SafeSpace_Weaponized (1).ipynb`) uses the same modules; upload
 `thresholds.py clip_sampler.py incident.py frame_prep.py prepared_frames.py frame_cache.py

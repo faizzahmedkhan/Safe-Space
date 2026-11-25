@@ -41,10 +41,16 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 
 from incident import make_tracker
+from thresholds import SCORE_HISTORY_LEN, SUSTAINED_CONSECUTIVE
 
 log = logging.getLogger("safespace.clip_eval")
 
 CLIP_SCORES = ("first_p", "max_p", "mean_p", "peak_smoothed")
+# The live rule's sustained path needs a full score history plus
+# SUSTAINED_CONSECUTIVE windows above threshold (4 + 2 - 1 = 5 windows); the
+# spike path needs 2.  Clips shorter than this can barely alert at all, so the
+# live rule is also reported on the clips long enough for both paths.
+LIVE_RULE_MIN_WINDOWS = SCORE_HISTORY_LEN + SUSTAINED_CONSECUTIVE - 1
 DEFAULT_TARGET_NORMAL_RECALL = 0.90
 
 
@@ -244,6 +250,14 @@ def summarize(
             "threshold_at_target": at["threshold"],
         }
     out["live"] = decision_metrics(y, [int(r["would_alert"]) for r in rows])
+    long_rows = [r for r in rows if r["n_windows"] >= LIVE_RULE_MIN_WINDOWS]
+    y_long = [r["y_true"] for r in long_rows]
+    out["live_long_clips"] = {
+        "min_windows": LIVE_RULE_MIN_WINDOWS,
+        "n_clips": len(long_rows),
+        "n_dangerous": int(sum(y_long)),
+        **decision_metrics(y_long, [int(r["would_alert"]) for r in long_rows]),
+    }
     by_cls: Dict[str, List[int]] = {}
     for r in rows:
         by_cls.setdefault(r["class"], []).append(int(r["would_alert"]))
@@ -292,9 +306,179 @@ def format_summary(summary: Dict[str, Any]) -> str:
         f"Normal recall {f(lv['normal_recall'])}  Dangerous recall {f(lv['dangerous_recall'])}  "
         f"macro-F1 {f(lv['macro_f1'])}"
     )
+    ll = summary.get("live_long_clips")
+    if ll is not None:
+        lines.append(
+            f"live rule, clips with >= {ll['min_windows']} windows ({ll['n_clips']} clips, "
+            f"{ll['n_dangerous']} dangerous): TN={ll['tn']} FP={ll['fp']} FN={ll['fn']} TP={ll['tp']} | "
+            f"Normal recall {f(ll['normal_recall'])}  Dangerous recall {f(ll['dangerous_recall'])}"
+        )
     rates = ", ".join(f"{c}={f(v)}" for c, v in summary["live_alert_rate_by_class"].items())
     lines.append(f"live alert rate by class: {rates}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- uncertainty
+# Clip-level metrics on 400 validation clips move by a few hundredths between
+# runs that differ only in their random seed.  The bootstrap below puts an
+# interval on each number, and compare_runs tests whether run B beats run A on
+# the SAME clips.  Clips from one similarity cluster are near-duplicates, so
+# when `groups` (path -> cluster id) is given, whole clusters are resampled;
+# resampling single clips would make the intervals too narrow.
+
+def _metric_recall_at_target(y: np.ndarray, s: np.ndarray) -> float:
+    return recall_at_normal_recall(y, s, DEFAULT_TARGET_NORMAL_RECALL)["dangerous_recall"]
+
+
+# name -> (row column, function(y, scores)); higher is better for all of them.
+CI_METRICS: Dict[str, Tuple[str, Callable[[np.ndarray, np.ndarray], float]]] = {
+    "roc_auc_max": ("max_p", roc_auc),
+    "pr_auc_max": ("max_p", average_precision),
+    "recall_at_target_max": ("max_p", _metric_recall_at_target),
+    "roc_auc_first": ("first_p", roc_auc),
+}
+
+
+def _resample_plan(
+    paths: Sequence[str], groups: Optional[Dict[str, Any]], rng: np.random.Generator, n_boot: int
+) -> List[np.ndarray]:
+    """Index arrays, one per bootstrap replicate (cluster-level when grouped)."""
+    n = len(paths)
+    if not groups:
+        return [rng.integers(0, n, n) for _ in range(n_boot)]
+    members: Dict[Any, List[int]] = {}
+    for i, p in enumerate(paths):
+        members.setdefault(groups.get(p, ("clip", p)), []).append(i)
+    clusters = [np.asarray(v, np.int64) for v in members.values()]
+    plans = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(clusters), len(clusters))
+        plans.append(np.concatenate([clusters[k] for k in pick]))
+    return plans
+
+
+def _interval(values: np.ndarray, alpha: float) -> Tuple[float, float]:
+    v = values[np.isfinite(values)]
+    if len(v) == 0:
+        return float("nan"), float("nan")
+    return float(np.quantile(v, alpha / 2)), float(np.quantile(v, 1 - alpha / 2))
+
+
+def bootstrap_metrics(
+    rows: Sequence[Dict[str, Any]],
+    groups: Optional[Dict[str, Any]] = None,
+    metrics: Sequence[str] = tuple(CI_METRICS),
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Dict[str, Dict[str, float]]:
+    """Point value and (1 - alpha) bootstrap interval for each metric."""
+    paths = [r["path"] for r in rows]
+    y = np.array([r["y_true"] for r in rows], np.int64)
+    cols = {name: np.array([r[CI_METRICS[name][0]] for r in rows], np.float64) for name in metrics}
+    plans = _resample_plan(paths, groups, np.random.default_rng(seed), n_boot)
+    out: Dict[str, Dict[str, float]] = {}
+    for name in metrics:
+        fn, s = CI_METRICS[name][1], cols[name]
+        boots = np.array([fn(y[ix], s[ix]) for ix in plans], np.float64)
+        low, high = _interval(boots, alpha)
+        out[name] = {"value": float(fn(y, s)), "low": low, "high": high}
+    return out
+
+
+def compare_runs(
+    rows_a: Sequence[Dict[str, Any]],
+    rows_b: Sequence[Dict[str, Any]],
+    groups: Optional[Dict[str, Any]] = None,
+    metrics: Sequence[str] = tuple(CI_METRICS),
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Dict[str, Dict[str, float]]:
+    """Paired bootstrap of metric(B) - metric(A) on the clips both runs scored.
+
+    Each replicate resamples the same clips (or clusters) for both runs, so
+    clip difficulty cancels out and only the model difference remains.
+    `p_b_not_better` = share of replicates where B is not ahead: below 0.05,
+    B's lead is unlikely to be luck of the validation sample."""
+    a_by = {r["path"]: r for r in rows_a}
+    b_by = {r["path"]: r for r in rows_b}
+    paths = sorted(set(a_by) & set(b_by))
+    if not paths:
+        raise ValueError("the two runs share no clips; were they scored on the same split?")
+    mismatched = [p for p in paths if a_by[p]["y_true"] != b_by[p]["y_true"]]
+    if mismatched:
+        raise ValueError(f"labels differ between runs for {len(mismatched)} clips, e.g. {mismatched[0]}")
+    y = np.array([a_by[p]["y_true"] for p in paths], np.int64)
+    plans = _resample_plan(paths, groups, np.random.default_rng(seed), n_boot)
+    out: Dict[str, Dict[str, float]] = {"_n_clips": {"value": float(len(paths))}}
+    for name in metrics:
+        col, fn = CI_METRICS[name]
+        sa = np.array([a_by[p][col] for p in paths], np.float64)
+        sb = np.array([b_by[p][col] for p in paths], np.float64)
+        diffs = np.array([fn(y[ix], sb[ix]) - fn(y[ix], sa[ix]) for ix in plans], np.float64)
+        low, high = _interval(diffs, alpha)
+        finite = diffs[np.isfinite(diffs)]
+        out[name] = {
+            "a": float(fn(y, sa)),
+            "b": float(fn(y, sb)),
+            "diff": float(fn(y, sb) - fn(y, sa)),
+            "low": low,
+            "high": high,
+            "p_b_not_better": float(np.mean(finite <= 0)) if len(finite) else float("nan"),
+        }
+    return out
+
+
+def format_intervals(ci: Dict[str, Dict[str, float]], alpha: float = 0.05) -> str:
+    pct = int(round(100 * (1 - alpha)))
+    lines = [f"{'metric':<22}{'value':>7}   {pct}% interval"]
+    for name, m in ci.items():
+        lines.append(f"{name:<22}{m['value']:>7.3f}   [{m['low']:.3f}, {m['high']:.3f}]")
+    return "\n".join(lines)
+
+
+def format_comparison(cmp: Dict[str, Dict[str, float]], label_a: str = "A", label_b: str = "B") -> str:
+    lines = [
+        f"{int(cmp['_n_clips']['value'])} clips scored by both runs; difference = {label_b} - {label_a}",
+        f"{'metric':<22}{label_a[:9]:>9}{label_b[:9]:>9}{'diff':>8}   95% interval    P({label_b[:9]} not better)",
+    ]
+    for name, m in cmp.items():
+        if name.startswith("_"):
+            continue
+        lines.append(
+            f"{name:<22}{m['a']:>9.3f}{m['b']:>9.3f}{m['diff']:>+8.3f}   "
+            f"[{m['low']:+.3f}, {m['high']:+.3f}]   {m['p_b_not_better']:.3f}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- per-clip CSV
+ROW_COLUMNS = ("path", "class", "y_true", "n_windows", "short", "first_p", "max_p", "mean_p",
+               "peak_smoothed", "would_alert", "n_incidents", "trigger", "suitable_frac")
+
+
+def write_rows_csv(rows: Sequence[Dict[str, Any]], path: str) -> None:
+    """One line per clip, so two runs can be compared later (compare_runs)."""
+    import csv
+
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(ROW_COLUMNS), extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def read_rows_csv(path: str) -> List[Dict[str, Any]]:
+    import csv
+
+    def as_bool(v: str) -> bool:
+        return v.strip().lower() in ("true", "1")
+
+    conv = {"y_true": int, "n_windows": int, "n_incidents": int, "short": as_bool, "would_alert": as_bool,
+            "first_p": float, "max_p": float, "mean_p": float, "peak_smoothed": float, "suitable_frac": float}
+    with open(path, newline="") as f:
+        return [{k: conv.get(k, str)(v) for k, v in row.items()} for row in csv.DictReader(f)]
 
 
 # ---------------------------------------------------------------- scoring (torch)
