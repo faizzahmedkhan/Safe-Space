@@ -1,0 +1,27 @@
+{
+  "thresholds": {
+    "spike_threshold": 0.97,
+    "alert_threshold": 0.67
+  },
+  "preprocessing": {
+    "name": "v1",
+    "crop": "frame",
+    "normalize": "none"
+  },
+  "model": {
+    "file_sha256_12": "d95c2623b3d4",
+    "trained": "2026-11-24, SafeSpace_Weaponized notebook (feature/frame-cache-deployment-eval), seed 42",
+    "recipe": "R3D-18 Kinetics-400, layer4 + new 2-class fc trainable, Adam (fc 1e-3, layer4 1e-5), sqrt class weights, batch 8, 8 epochs, best epoch 8 by validation PR-AUC (max window)",
+    "data": "SCVD via clean_split_manifest.csv; validation = 15% of train clusters by MD5 hash (400 clips, 78 clusters)"
+  },
+  "validation": {
+    "roc_auc_max": 0.861,
+    "roc_auc_max_95ci_cluster_bootstrap": [
+      0.769,
+      0.983
+    ],
+    "pr_auc_max": 0.921,
+    "dangerous_recall_at_normal_recall_0_90": 0.677
+  },
+  "threshold_note": "Interim. spike_threshold 0.97 chosen on validation: catches 79% of dangerous clips (max window) while flagging 4% of normal scenes (23% of normal clips; most false alarms come from one large normal scene). alert_threshold kept at 0.67: 1-second validation clips cannot calibrate the 4-window average. Recalibrate both with video_calibration.py on footage from the deployment cameras."
+}

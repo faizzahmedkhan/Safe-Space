@@ -25,7 +25,7 @@ Usage:
         --spike-threshold 0.85 --pad-seconds 2.0
 
 Requires: the same weights as main.py (env SAFESPACE_MODEL, else the first
-existing of the v3 / smart_crop / base .pth in the working directory, or pass
+existing of the v4_baseline / v3 / smart_crop / base .pth in the working directory, or pass
 --model-path).
 """
 

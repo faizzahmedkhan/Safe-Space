@@ -168,7 +168,7 @@ def _persist_alerts() -> None:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info("Booting AI Core on: %s", device)
 
-# Model path: env SAFESPACE_MODEL, else first existing of v3 / smart_crop / base.
+# Model path: env SAFESPACE_MODEL, else first existing of v4_baseline / v3 / smart_crop / base.
 # Thresholds: from <model>.json sidecar if present, else inference_core defaults.
 model, MODEL_INFO = load_model(device=device)
 MODEL_VERSION = MODEL_INFO["version"]

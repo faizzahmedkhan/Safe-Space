@@ -26,7 +26,8 @@ track them with `git add -f`). Put the weights file in the project root, or use
 The backend picks the model like this:
 
 1. `SAFESPACE_MODEL=<path to .pth>` if set, otherwise
-2. the first existing file of `safespace_bullying_model_v3_weaponized.pth`,
+2. the first existing file of `safespace_bullying_model_v4_baseline.pth` (the current model,
+   trained 24 Nov 2026), `safespace_bullying_model_v3_weaponized.pth`,
    `safespace_bullying_model_smart_crop.pth`, `safespace_bullying_model.pth`.
 
 At boot it logs the file's SHA-256 (first 12 chars) and every alert is stamped with

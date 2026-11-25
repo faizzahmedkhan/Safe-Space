@@ -55,6 +55,7 @@ log = logging.getLogger("safespace.core")
 
 MODEL_ENV = "SAFESPACE_MODEL"
 MODEL_CANDIDATES = [
+    "safespace_bullying_model_v4_baseline.pth",
     "safespace_bullying_model_v3_weaponized.pth",
     "safespace_bullying_model_smart_crop.pth",
     "safespace_bullying_model.pth",
