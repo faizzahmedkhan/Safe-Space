@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Iterable, List, Optional, Set
+from typing import Iterable, List, Optional, Sequence, Set, Union
 
 log = logging.getLogger("safespace.retention")
 
@@ -22,12 +22,15 @@ def retention_budgets() -> dict:
     return {
         "evidence": (_env_num("SAFESPACE_EVIDENCE_MAX_MB", 5000), _env_num("SAFESPACE_EVIDENCE_MAX_DAYS", 30)),
         "uploads": (_env_num("SAFESPACE_UPLOADS_MAX_MB", 2000), _env_num("SAFESPACE_UPLOADS_MAX_DAYS", 7)),
-        "calibration": (_env_num("SAFESPACE_CALIBRATION_MAX_MB", 2000), _env_num("SAFESPACE_CALIBRATION_MAX_DAYS", 7)),
+        # Calibration runs are kept as history (compare models and thresholds
+        # over time), so by default only a size cap applies, oldest first, and
+        # run records (*_run.json) are never deleted (see main.run_retention).
+        "calibration": (_env_num("SAFESPACE_CALIBRATION_MAX_MB", 2000), _env_num("SAFESPACE_CALIBRATION_MAX_DAYS", 0)),
     }
 
 
 def prune_dir(
-    directory: str,
+    directory: Union[str, Sequence[str]],
     max_mb: float,
     max_days: float,
     protected_names: Optional[Iterable[str]] = None,
@@ -37,21 +40,26 @@ def prune_dir(
     """Delete files (top level only) older than max_days, then oldest-first
     until the total is within max_mb.  Files named in `protected_names` and
     files modified within `min_age_s` are never deleted.  Returns removed
-    basenames."""
-    if not os.path.isdir(directory):
-        return []
+    basenames.  `directory` may be a list: its folders then share ONE budget
+    (oldest file first across all of them)."""
+    dirs = [directory] if isinstance(directory, str) else list(directory)
     now = time.time() if now is None else now
     protected: Set[str] = set(protected_names or ())
     entries = []
-    for name in os.listdir(directory):
-        p = os.path.join(directory, name)
-        if not os.path.isfile(p):
+    for d in dirs:
+        if not os.path.isdir(d):
             continue
-        try:
-            st = os.stat(p)
-        except OSError:
-            continue
-        entries.append((st.st_mtime, name, st.st_size, p))
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if not os.path.isfile(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, name, st.st_size, p))
+    if not entries:
+        return []
     entries.sort()  # oldest first
     removed: List[str] = []
 

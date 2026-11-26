@@ -99,9 +99,19 @@ export function evidenceUrl(pathOrName: string): string {
   return withKey(`${getApiUrl()}/evidence/${cid(name)}`);
 }
 
+export type ModelThresholds = {
+  spike_threshold: number;
+  alert_threshold: number;
+  score_history_len: number;
+};
+
 export type RootResponse = {
   watcher_last_cycle_age_ms?: number | null;
   model_version?: string | null;
+  model_name?: string | null;
+  preprocessing?: string | null;
+  thresholds?: ModelThresholds;
+  thresholds_from_sidecar?: boolean;
   auth_enabled?: boolean;
   [k: string]: unknown;
 };
@@ -290,4 +300,130 @@ export async function labelEvidence(
       body: JSON.stringify({ label }),
     })
   ).json();
+}
+
+// ---------------------------------------------------------------- calibration
+export const CALIBRATION_TIMEOUT_MS = 30 * 60 * 1000;
+
+export type CalibrationSettings = {
+  target_fps: number;
+  spike_threshold: number;
+  alert_threshold: number;
+  history_len: number;
+  pad_seconds: number;
+  merge_gap_seconds: number;
+};
+
+export type CalibrationEvent = {
+  start_sec: number;
+  end_sec: number;
+  peak_score: number;
+  trigger: string;
+  url: string;
+  clip_available?: boolean;
+};
+
+export type CalibrationSample = {
+  time_sec: number;
+  raw_score: number;
+  smoothed_avg: number;
+  triggered?: boolean;
+  trigger_reason?: string;
+  suitable_for_model?: boolean;
+  global_motion?: boolean;
+};
+
+export type CalibrationModel = {
+  version: string | null;
+  name: string | null;
+  sha256_12: string | null;
+  preprocessing: string | null;
+  legacy_model_type?: string;
+};
+
+/** A saved run: schema 2 records carry model + settings; schema 1 (older runs) do not. */
+export type CalibrationRun = {
+  schema: number;
+  run_id: string;
+  created_at: string;
+  created_ts: number;
+  video_name: string;
+  video_url: string | null;
+  video_available: boolean;
+  source?: { kind: string; url?: string; original_name?: string; rerun_of?: string | null } | null;
+  model: CalibrationModel;
+  settings: CalibrationSettings | null;
+  summary: { duration_sec: number; n_windows: number; n_events: number; peak_raw: number; framing_suitable_ratio: number | null };
+  native_fps: number;
+  events: CalibrationEvent[];
+  per_sample_log: CalibrationSample[];
+};
+
+export type CalibrationRunSummary = {
+  run_id: string;
+  schema: number;
+  created_at: string;
+  created_ts: number;
+  video_name: string;
+  video_available: boolean;
+  source: string | null;
+  model_name: string | null;
+  model_version: string | null;
+  preprocessing: string | null;
+  spike_threshold: number | null;
+  alert_threshold: number | null;
+  history_len: number | null;
+  n_events: number;
+  duration_sec: number | null;
+  n_windows: number | null;
+  peak_raw: number | null;
+};
+
+function appendSettings(body: FormData, s: CalibrationSettings): void {
+  body.append("target_fps", String(s.target_fps));
+  body.append("spike_threshold", String(s.spike_threshold));
+  body.append("alert_threshold", String(s.alert_threshold));
+  body.append("history_len", String(s.history_len));
+  body.append("pad_seconds", String(s.pad_seconds));
+  body.append("merge_gap_seconds", String(s.merge_gap_seconds));
+}
+
+/** Calibrate a new video (file upload or YouTube URL) with the backend's loaded model. */
+export async function runCalibration(
+  source: { file: File } | { youtubeUrl: string },
+  settings: CalibrationSettings,
+  signal?: AbortSignal
+): Promise<CalibrationRun> {
+  const body = new FormData();
+  if ("file" in source) body.append("video_file", source.file);
+  else body.append("youtube_url", source.youtubeUrl);
+  appendSettings(body, settings);
+  return (await apiFetch("/calibration/run", { method: "POST", body, signal, timeoutMs: CALIBRATION_TIMEOUT_MS })).json();
+}
+
+/** Re-calibrate a video already on the server, with the loaded model and new settings. */
+export async function rerunCalibration(
+  videoName: string,
+  settings: CalibrationSettings,
+  rerunOf?: string,
+  signal?: AbortSignal
+): Promise<CalibrationRun> {
+  const body = new FormData();
+  body.append("video_name", videoName);
+  if (rerunOf) body.append("rerun_of", rerunOf);
+  appendSettings(body, settings);
+  return (await apiFetch("/calibration/rerun", { method: "POST", body, signal, timeoutMs: CALIBRATION_TIMEOUT_MS })).json();
+}
+
+export async function fetchCalibrationRuns(signal?: AbortSignal): Promise<CalibrationRunSummary[]> {
+  const data = await (await apiFetch("/calibration/runs", { signal, timeoutMs: 15000 })).json();
+  return (data.runs || []) as CalibrationRunSummary[];
+}
+
+export async function fetchCalibrationRun(runId: string, signal?: AbortSignal): Promise<CalibrationRun> {
+  return (await apiFetch(`/calibration/runs/${cid(runId)}`, { signal, timeoutMs: 30000 })).json();
+}
+
+export function calibrationMediaUrl(path: string): string {
+  return withKey(`${getApiUrl()}${path}`);
 }

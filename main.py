@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from pydantic import BaseModel, Field
 
 from bridge_ctl import ensure_lan_bridge
+from calibration_runs import CalibrationStore, build_record as build_calibration_record, is_run_id
 from camera import CameraStream, diagnose_http_camera
 from clip_sampler import window_coverage
 from evidence_video import make_browser_compatible
@@ -772,7 +773,11 @@ def run_retention() -> dict:
     removed = {
         "evidence": prune_dir(EVIDENCE_DIR, *budgets["evidence"], protected_names=protected),
         "uploads": prune_dir(UPLOADS_DIR, *budgets["uploads"], protected_names=protected),
-        "calibration": prune_dir(CALIBRATION_DIR, *budgets["calibration"], protected_names=protected),
+        "calibration": prune_dir(
+            [CALIBRATION_DIR, calibration_store.inputs, calibration_store.outputs],
+            *budgets["calibration"],
+            protected_names=protected | calibration_store.run_json_names(),
+        ),
     }
     if removed["evidence"]:
         gone = set(removed["evidence"])
@@ -1013,7 +1018,14 @@ def read_root():
         "cameras_active": sum(1 for s in cameras.values() if s["stream"].is_active()),
         "watcher_last_cycle_age_ms": _watcher_age_ms(),
         "model_version": MODEL_VERSION,
+        "model_name": MODEL_INFO["name"],
         "preprocessing": PREPROC.name,
+        "thresholds": {
+            "spike_threshold": SPIKE_THRESHOLD,
+            "alert_threshold": ALERT_THRESHOLD,
+            "score_history_len": SCORE_HISTORY_LEN,
+        },
+        "thresholds_from_sidecar": bool(MODEL_INFO["thresholds_from_sidecar"]),
         "auth_enabled": AUTH_ENABLED,
     }
 
@@ -1421,7 +1433,9 @@ def preview_page(camera_id: str, request: Request):
 
 
 CALIBRATION_DIR = "uploads/calibration"
-os.makedirs(CALIBRATION_DIR, exist_ok=True)
+# Run history: inputs/ (source videos) and outputs/ (one <run_id>_run.json per
+# run + the clips it cut).  See calibration_runs.py.
+calibration_store = CalibrationStore(CALIBRATION_DIR)
 
 
 def _yt_match_filter(info_dict, *, incomplete=False):
@@ -1434,21 +1448,111 @@ def _yt_match_filter(info_dict, *, incomplete=False):
     return None
 
 
+def _calibration_settings(
+    target_fps: float,
+    spike_threshold: Optional[float],
+    alert_threshold: Optional[float],
+    history_len: Optional[int],
+    pad_seconds: float,
+    merge_gap_seconds: float,
+) -> dict:
+    """Effective settings: anything not sent falls back to the LOADED MODEL's
+    thresholds (its sidecar), so a run always records what it actually used."""
+    s = {
+        "target_fps": float(target_fps),
+        "spike_threshold": float(SPIKE_THRESHOLD if spike_threshold is None else spike_threshold),
+        "alert_threshold": float(ALERT_THRESHOLD if alert_threshold is None else alert_threshold),
+        "history_len": int(SCORE_HISTORY_LEN if history_len is None else history_len),
+        "pad_seconds": float(pad_seconds),
+        "merge_gap_seconds": float(merge_gap_seconds),
+    }
+    if not (1.0 <= s["target_fps"] <= 60.0):
+        raise HTTPException(status_code=400, detail="target_fps must be between 1 and 60.")
+    for k in ("spike_threshold", "alert_threshold"):
+        if not (0.0 < s[k] <= 1.0):
+            raise HTTPException(status_code=400, detail=f"{k} must be in (0, 1].")
+    if not (1 <= s["history_len"] <= 20):
+        raise HTTPException(status_code=400, detail="history_len must be between 1 and 20.")
+    if not (0.0 <= s["pad_seconds"] <= 30.0) or not (0.0 <= s["merge_gap_seconds"] <= 30.0):
+        raise HTTPException(status_code=400, detail="pad_seconds and merge_gap_seconds must be 0-30 s.")
+    return s
+
+
+async def _calibrate_and_record(video_path: str, source: dict, settings: dict) -> dict:
+    """Run the live pipeline over a video with the loaded model, cut a clip per
+    incident into outputs/, save the run record, and return it."""
+    add_log(f"Starting calibration analysis on {video_path} with {MODEL_VERSION}", kind="calibration")
+    try:
+        events, per_sample_log, native_fps = await asyncio.to_thread(
+            process_video,
+            video_path,
+            model,
+            device,
+            target_fps=settings["target_fps"],
+            spike_threshold=settings["spike_threshold"],
+            alert_threshold=settings["alert_threshold"],
+            history_len=settings["history_len"],
+            pad_seconds=settings["pad_seconds"],
+            merge_gap_seconds=settings["merge_gap_seconds"],
+            thresholds=THRESHOLDS,
+        )
+    except Exception as e:
+        add_log(f"Calibration processing failed: {e}", level="error", kind="calibration")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+
+    run_id = CalibrationStore.new_run_id(video_path, MODEL_INFO["name"], MODEL_INFO["sha256_12"])
+    clips = []
+    for i, (s, e, peak, trig) in enumerate(events, 1):
+        out_name = CalibrationStore.clip_name(run_id, i, trig, s, e, peak)
+        out_path = os.path.join(calibration_store.outputs, out_name)
+        try:
+            await asyncio.to_thread(cut_clip, video_path, out_path, s, e)
+            clips.append({
+                "start_sec": round(s, 2),
+                "end_sec": round(e, 2),
+                "peak_score": round(peak, 4),
+                "trigger": trig,
+                "url": f"/calibration/clip/{out_name}",
+            })
+        except Exception as exc:
+            add_log(f"ffmpeg failed for {s:.1f}s-{e:.1f}s: {exc}", level="error", kind="calibration")
+
+    record = build_calibration_record(
+        run_id=run_id,
+        video_path=video_path,
+        source=source,
+        model_info=MODEL_INFO,
+        settings=settings,
+        native_fps=native_fps,
+        events=clips,
+        per_sample_log=per_sample_log,
+    )
+    try:
+        calibration_store.save(record)
+    except Exception as exc:  # the result is still returned; only history misses it
+        add_log(f"Could not save calibration run {run_id}: {exc}", level="error", kind="calibration")
+    add_log(f"Calibration complete for {video_path}. {len(clips)} events (run {run_id}).", kind="calibration")
+    loaded = calibration_store.load(run_id)
+    return loaded if loaded is not None else record
+
+
 @app.post("/calibration/run")
 async def run_calibration(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
     target_fps: float = Form(CAMERA_TARGET_FPS),
-    spike_threshold: float = Form(SPIKE_THRESHOLD),
-    alert_threshold: float = Form(ALERT_THRESHOLD),
-    history_len: int = Form(SCORE_HISTORY_LEN),
+    spike_threshold: Optional[float] = Form(None),
+    alert_threshold: Optional[float] = Form(None),
+    history_len: Optional[int] = Form(None),
     pad_seconds: float = Form(2.0),
     merge_gap_seconds: float = Form(1.5),
 ):
+    """Calibrate a new video (upload or YouTube) with the loaded model.
+    Thresholds not sent default to the model's own (sidecar) thresholds."""
     if not video_file and not youtube_url:
         raise HTTPException(status_code=400, detail="Must provide video_file or youtube_url.")
-    if not (1.0 <= target_fps <= 60.0):
-        raise HTTPException(status_code=400, detail="target_fps must be between 1 and 60.")
+    settings = _calibration_settings(target_fps, spike_threshold, alert_threshold, history_len,
+                                     pad_seconds, merge_gap_seconds)
 
     video_path = None
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1460,7 +1564,7 @@ async def run_calibration(
         add_log(f"Downloading YouTube video: {youtube_url}", kind="calibration")
         ydl_opts = {
             'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
-            'outtmpl': os.path.join(CALIBRATION_DIR, f'yt_{stamp}_%(id)s.%(ext)s'),
+            'outtmpl': os.path.join(calibration_store.inputs, f'yt_{stamp}_%(id)s.%(ext)s'),
             'merge_output_format': 'mp4',
             'quiet': True,
             'noplaylist': True,
@@ -1482,83 +1586,81 @@ async def run_calibration(
                     if os.path.exists(mp4_target):
                         return mp4_target
                     base = os.path.basename(target).split('.')[0]
-                    for f in os.listdir(CALIBRATION_DIR):
+                    for f in os.listdir(calibration_store.inputs):
                         if base in f:
-                            return os.path.join(CALIBRATION_DIR, f)
+                            return os.path.join(calibration_store.inputs, f)
                     raise RuntimeError("Download rejected (video too long, too large or unavailable).")
             video_path = await asyncio.to_thread(download_yt)
         except Exception as e:
             add_log(f"YouTube download failed: {e}", level="error", kind="calibration")
             raise HTTPException(status_code=400, detail=f"YouTube download failed: {e}")
+        source = {"kind": "youtube", "url": youtube_url}
     else:
         name = os.path.basename(video_file.filename or "clip.mp4")
         if not is_video_filename(name):
             raise HTTPException(status_code=400, detail="Upload an mp4/avi/mov/mkv/webm video.")
-        safe = re.sub(r"[^\w.\-]", "_", name)
-        video_path = os.path.join(CALIBRATION_DIR, f"upload_{stamp}_{safe}")
+        video_path = calibration_store.new_input_path(name, stamp)
         await _save_upload(video_file, video_path)
+        source = {"kind": "upload", "original_name": name}
 
-    add_log(f"Starting calibration analysis on {video_path}", kind="calibration")
+    return await _calibrate_and_record(video_path, source, settings)
+
+
+@app.post("/calibration/rerun")
+async def rerun_calibration(
+    video_name: str = Form(...),
+    rerun_of: Optional[str] = Form(None),
+    target_fps: float = Form(CAMERA_TARGET_FPS),
+    spike_threshold: Optional[float] = Form(None),
+    alert_threshold: Optional[float] = Form(None),
+    history_len: Optional[int] = Form(None),
+    pad_seconds: float = Form(2.0),
+    merge_gap_seconds: float = Form(1.5),
+):
+    """Re-calibrate a video that is already on the server (by file name) with
+    the loaded model and new settings: compare thresholds, or new weights after
+    a restart, without uploading again.  A new run is recorded; the old one stays."""
+    video_path = calibration_store.find_input(video_name)
+    if video_path is None:
+        raise HTTPException(status_code=404, detail="Source video not found (it may have been removed by retention).")
+    if rerun_of is not None and not is_run_id(rerun_of):
+        raise HTTPException(status_code=400, detail="Invalid rerun_of run id.")
+    settings = _calibration_settings(target_fps, spike_threshold, alert_threshold, history_len,
+                                     pad_seconds, merge_gap_seconds)
+    return await _calibrate_and_record(video_path, {"kind": "rerun", "rerun_of": rerun_of}, settings)
+
+
+@app.get("/calibration/runs")
+def list_calibration_runs():
+    """Every recorded run, newest first (summaries; open one for its details)."""
+    return {"runs": calibration_store.list()}
+
+
+@app.get("/calibration/runs/{run_id}")
+def get_calibration_run(run_id: str):
+    if not is_run_id(run_id):
+        raise HTTPException(status_code=400, detail="Invalid run id.")
     try:
-        events, per_sample_log, native_fps = await asyncio.to_thread(
-            process_video,
-            video_path,
-            model,
-            device,
-            target_fps=target_fps,
-            spike_threshold=spike_threshold,
-            alert_threshold=alert_threshold,
-            history_len=history_len,
-            pad_seconds=pad_seconds,
-            merge_gap_seconds=merge_gap_seconds,
-            thresholds=THRESHOLDS,
-        )
+        rec = calibration_store.load(run_id)
     except Exception as e:
-        add_log(f"Calibration processing failed: {e}", level="error", kind="calibration")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-
-    clips = []
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    for i, (s, e, peak, trig) in enumerate(events, 1):
-        out_name = f"{base}_event{i:02d}_{trig}_{s:.1f}s-{e:.1f}s_peak{peak:.2f}.mp4"
-        out_path = os.path.join(CALIBRATION_DIR, out_name)
-        try:
-            await asyncio.to_thread(cut_clip, video_path, out_path, s, e)
-            clips.append({
-                "start_sec": round(s, 2),
-                "end_sec": round(e, 2),
-                "peak_score": round(peak, 4),
-                "trigger": trig,
-                "url": f"/calibration/clip/{out_name}"
-            })
-        except Exception as exc:
-            add_log(f"ffmpeg failed for {s:.1f}s-{e:.1f}s: {exc}", level="error", kind="calibration")
-
-    add_log(f"Calibration complete for {video_path}. {len(clips)} events.", kind="calibration")
-    return {
-        "ok": True,
-        "video_path": video_path,
-        "native_fps": native_fps,
-        "events": clips,
-        "per_sample_log": per_sample_log,
-        "model_version": MODEL_VERSION,
-    }
+        raise HTTPException(status_code=500, detail=f"Run record is unreadable: {e}")
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return rec
 
 
 @app.api_route("/calibration/clip/{filename}", methods=["GET", "HEAD"])
 def get_calibration_clip(filename: str):
+    """An incident clip (outputs/) or a source video (inputs/, or the old flat folder)."""
     if not is_clip_filename(filename):
         raise HTTPException(status_code=400, detail="Invalid clip filename.")
-    safe_name = filename
-
-    path = os.path.join(CALIBRATION_DIR, safe_name)
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="Clip file not found.")
-
+    path = calibration_store.find_clip(filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Clip file not found (it may have been removed by retention).")
     return FileResponse(
         path,
         media_type="video/mp4",
-        filename=safe_name,
+        filename=filename,
         headers={
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",

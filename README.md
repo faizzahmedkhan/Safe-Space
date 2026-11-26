@@ -110,7 +110,7 @@ If `uvicorn` is not found, ensure the virtual environment is activated and retry
 | `SAFESPACE_LOG_DIR` | `logs` | Rotating log file `safespace.log` (5 MB x 5). |
 | `SAFESPACE_EVIDENCE_MAX_MB` / `_MAX_DAYS` | `5000` / `30` | Retention for `evidence/`. |
 | `SAFESPACE_UPLOADS_MAX_MB` / `_MAX_DAYS` | `2000` / `7` | Retention for `uploads/`. |
-| `SAFESPACE_CALIBRATION_MAX_MB` / `_MAX_DAYS` | `2000` / `7` | Retention for `uploads/calibration/`. |
+| `SAFESPACE_CALIBRATION_MAX_MB` / `_MAX_DAYS` | `2000` / `0` | Retention for `uploads/calibration/` (size only by default; run records are never deleted). |
 
 ### Authentication
 
@@ -127,6 +127,18 @@ that limit). It never deletes evidence of incidents that are still recording/pro
 files that were copied into `data/safe` or `data/unsafe`, or files younger than 10 minutes.
 Alerts whose clip was pruned keep their record with `evidence_pruned: true` and no
 `evidence_url`.
+
+### Calibration history
+
+Each run on the calibration page uses the model the backend has loaded and saves a record in
+`uploads/calibration/outputs/<run_id>_run.json`: the weights (name and hash), the preprocessing,
+the thresholds used, the events and the score for every window. Source videos go to
+`uploads/calibration/inputs/` and incident clips to `outputs/`. The page's *Past runs* tab
+lists these records, including older ones that don't have model or threshold fields. From there
+you can open a run, re-run its video with new settings (`POST /calibration/rerun`, no re-upload),
+and overlay two runs of the same video. Calibration retention removes the oldest videos and
+clips once the folder passes its size limit, and it never removes run records. When a run's
+video or clip has been removed, the page says so.
 
 ### How incidents work
 
